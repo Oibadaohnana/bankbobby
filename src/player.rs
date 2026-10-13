@@ -1,25 +1,30 @@
-//! The robber: the keys and the pointer read every frame, the body moved at
-//! a fixed sixty steps a second (`movement.rs`, bims' rules), and the
-//! picture stood between the last two steps and animated off the stride.
-
 use crate::dev::Script;
-use crate::movement::{Body, MARCH_SPEED, STEP, Solids, Steer, approach};
+use crate::movement::{Aabb, BODY_MARGIN, Body, MARCH_SPEED, STEP, Solids, Steer, TILE, approach};
 use crate::paint;
-use crate::render::{WorldMaterial, WorldMaterials, WorldPart};
-use bevy::input::mouse::MouseWheel;
+use crate::render::{Lamps, WorldMaterial, WorldMaterials, WorldPart, write_params};
+use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
-use std::f32::consts::TAU;
+use std::f32::consts::{PI, TAU};
 
-/// The body and what it bumps into.
 #[derive(Resource)]
 pub struct Player {
     pub body: Body,
     pub solids: Solids,
+    /// The half-height props' bodies.
+    pub cover: Vec<Aabb>,
 }
 
-/// What the keys and the pointer say, gathered once a frame and read by
-/// every fixed step until the next.
+impl Player {
+    pub fn in_cover(&self) -> bool {
+        self.body.is_crouching()
+            && self
+                .cover
+                .iter()
+                .any(|c| c.expand(BODY_MARGIN + TILE * 0.5).contains(self.body.pos))
+    }
+}
+
 #[derive(Resource, Default)]
 pub struct Controls {
     pub walk: Option<f32>,
@@ -27,9 +32,10 @@ pub struct Controls {
     pub sprint: bool,
     /// A roll asked for and not yet started.
     pub roll: bool,
+    pub torch: bool,
+    pub crouch: bool,
 }
 
-/// Where the picture stands this frame, between the last two steps.
 #[derive(Resource, Default)]
 pub struct Shown {
     pub pos: Vec2,
@@ -38,13 +44,14 @@ pub struct Shown {
 #[derive(Component)]
 pub struct Robber;
 
-#[derive(Component, Clone, Copy, PartialEq, Eq)]
+#[derive(Component, Clone, Copy)]
 pub enum Part {
-    Shadow,
     Foot(i8),
+    Knee(i8),
     Bag,
     Torso,
     Arm(i8),
+    Lens,
     Head,
     Streak(i8),
 }
@@ -72,19 +79,17 @@ impl Plugin for PlayerPlugin {
     }
 }
 
-/// Spawn the robber at the body, its parts as children.
 pub fn spawn_robber(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     material: Handle<WorldMaterial>,
     at: Vec2,
 ) {
-    let parts = paint::robber();
-    let mesh = |m: Mesh, meshes: &mut Assets<Mesh>| Mesh2d(meshes.add(m));
+    let p = paint::robber();
+    let [foot, knee, arm, crowbar, torch, lens, streak] =
+        [p.foot, p.knee, p.arm, p.crowbar, p.torch, p.lens, p.streak]
+            .map(|m| Mesh2d(meshes.add(m)));
     let mat = MeshMaterial2d(material);
-    let foot = meshes.add(parts.foot);
-    let arm = meshes.add(parts.arm);
-    let streak = meshes.add(parts.streak);
     commands
         .spawn((
             WorldPart,
@@ -94,60 +99,79 @@ pub fn spawn_robber(
         ))
         .with_children(|r| {
             r.spawn((
-                Part::Shadow,
-                mesh(parts.shadow, meshes),
+                Mesh2d(meshes.add(p.shadow)),
                 mat.clone(),
                 Transform::from_xyz(0.0, 0.0, -0.9),
             ));
             for side in [-1i8, 1] {
                 r.spawn((
                     Part::Foot(side),
-                    Mesh2d(foot.clone()),
+                    foot.clone(),
                     mat.clone(),
                     Transform::from_xyz(0.0, 8.0 * side as f32, -0.6),
+                ));
+                r.spawn((
+                    Part::Knee(side),
+                    knee.clone(),
+                    mat.clone(),
+                    Transform::from_xyz(0.0, 0.0, -0.3).with_scale(Vec3::ZERO),
                 ));
             }
             r.spawn((
                 Part::Torso,
-                mesh(parts.torso, meshes),
+                Mesh2d(meshes.add(p.torso)),
                 mat.clone(),
                 Transform::from_xyz(-1.0, 0.0, 0.0),
             ));
             r.spawn((
                 Part::Bag,
-                mesh(parts.bag, meshes),
+                Mesh2d(meshes.add(p.bag)),
                 mat.clone(),
                 Transform::from_xyz(-13.0, 0.0, 0.2),
             ));
             for side in [-1i8, 1] {
-                let mut arm_entity = r.spawn((
+                let hand = Transform::from_xyz(15.0, 0.0, 0.05);
+                r.spawn((
                     Part::Arm(side),
-                    Mesh2d(arm.clone()),
+                    arm.clone(),
                     mat.clone(),
                     Transform::from_xyz(1.0, 14.0 * side as f32, 0.3),
-                ));
-                if side < 0 {
-                    let crowbar = meshes.add(paint::robber().crowbar);
-                    arm_entity.with_children(|a| {
+                ))
+                .with_children(|a| {
+                    if side < 0 {
                         a.spawn((
-                            Mesh2d(crowbar),
+                            crowbar.clone(),
                             mat.clone(),
-                            Transform::from_xyz(15.0, 0.0, 0.05)
-                                .with_rotation(Quat::from_rotation_z(0.35)),
+                            hand.with_rotation(Quat::from_rotation_z(0.35)),
                         ));
-                    });
-                }
+                    } else {
+                        a.spawn((
+                            torch.clone(),
+                            mat.clone(),
+                            hand.with_rotation(Quat::from_rotation_z(0.42)),
+                        ))
+                        .with_children(|t| {
+                            t.spawn((
+                                Part::Lens,
+                                lens.clone(),
+                                mat.clone(),
+                                Transform::from_xyz(0.0, 0.0, 0.01),
+                                Visibility::Hidden,
+                            ));
+                        });
+                    }
+                });
             }
             r.spawn((
                 Part::Head,
-                mesh(parts.head, meshes),
+                Mesh2d(meshes.add(p.head)),
                 mat.clone(),
                 Transform::from_xyz(2.0, 0.0, 0.5),
             ));
             for k in [-1i8, 0, 1] {
                 r.spawn((
                     Part::Streak(k),
-                    Mesh2d(streak.clone()),
+                    streak.clone(),
                     mat.clone(),
                     Transform::from_xyz(-24.0, 9.0 * k as f32, -0.8),
                     Visibility::Hidden,
@@ -180,12 +204,21 @@ fn read_controls(
     }
     controls.walk = (d != Vec2::ZERO).then(|| d.y.atan2(d.x));
     controls.sprint = held(KeyCode::ShiftLeft, "Shift") || keys.pressed(KeyCode::ShiftRight);
+    if keys.just_pressed(KeyCode::KeyC) || script.pressed("Crouch") {
+        controls.crouch = !controls.crouch;
+    }
+    if controls.sprint && controls.walk.is_some() {
+        controls.crouch = false;
+    }
     if keys.just_pressed(KeyCode::Space)
         || keys.just_pressed(KeyCode::AltLeft)
         || keys.just_pressed(KeyCode::AltRight)
         || script.pressed("Roll")
     {
         controls.roll = true;
+    }
+    if keys.just_pressed(KeyCode::KeyT) || script.pressed("Torch") {
+        controls.torch = !controls.torch;
     }
     if let Some(aim) = script.aim {
         controls.aim = aim;
@@ -210,6 +243,7 @@ fn step(mut player: ResMut<Player>, mut controls: ResMut<Controls>) {
         walk: controls.walk,
         aim: controls.aim,
         sprint: controls.sprint,
+        crouch: controls.crouch,
     });
     if controls.roll {
         controls.roll = false;
@@ -218,21 +252,21 @@ fn step(mut player: ResMut<Player>, mut controls: ResMut<Controls>) {
     player.body.update(STEP, &player.solids);
 }
 
-/// Stand the picture between the last two steps.
 fn show(player: Res<Player>, time: Res<Time<Fixed>>, mut shown: ResMut<Shown>) {
     let b = &player.body;
-    let blend = time.overstep_fraction();
     shown.pos = if b.pos.distance(b.was) > 52.0 {
         b.pos
     } else {
-        b.was + (b.pos - b.was) * blend
+        b.was + (b.pos - b.was) * time.overstep_fraction()
     };
 }
 
 fn animate(
     player: Res<Player>,
+    controls: Res<Controls>,
     shown: Res<Shown>,
     time: Res<Time>,
+    mut crouch: Local<f32>,
     mut root: Query<&mut Transform, (With<Robber>, Without<Part>)>,
     mut parts: Query<(&Part, &mut Transform, &mut Visibility), Without<Robber>>,
 ) {
@@ -242,46 +276,85 @@ fn animate(
     };
     let rolling = b.roll_share();
     t.translation = shown.pos.extend(10.0);
-    let heading = match rolling {
-        // A roll spins the body once round, tucked small.
-        Some(share) => b.roll_dir().unwrap_or(b.heading) + share * TAU,
-        None => b.heading,
+    t.rotation = Quat::from_rotation_z(b.heading);
+    let down = if b.is_crouching() { 1.0 } else { 0.0 };
+    *crouch += (down - *crouch) * approach(14.0, time.delta_secs());
+    // A roll tucks into the crouch pose, quickly, and back out at the end.
+    let tuck = rolling.map_or(0.0, |s| ((PI * s).sin() * 2.0).min(1.0));
+    let c = crouch.max(tuck);
+    // Crouched from above: folded forward, knees out in front, a kneeling stance.
+    let m = |stand: f32, low: f32| stand + (low - stand) * c;
+    t.scale = Vec3::splat(m(1.0, 0.92) * (1.0 - 0.12 * tuck));
+    // Rolling, every part turns head over heels about the axis across the
+    // body: a part `up` above the middle goes forward, under, and back over
+    // the top. Draw order follows height.
+    let (sin, cos) = rolling.map_or((0.0, 1.0), |s| (s * TAU).sin_cos());
+    let flip = |pt: &mut Transform, x: f32, up: f32, z: f32| {
+        pt.translation.x = x * cos + up * sin;
+        pt.translation.z = if rolling.is_some() {
+            (up * cos - x * sin) * 0.03
+        } else {
+            z
+        };
     };
-    t.rotation = Quat::from_rotation_z(heading);
-    let tuck = rolling.map_or(1.0, |s| 0.8 + 0.2 * (s * TAU).cos().abs());
-    t.scale = Vec3::splat(tuck);
 
     let sprint = b.is_sprinting();
-    let pace = (b.speed / MARCH_SPEED).clamp(0.0, 1.0);
+    let pace = if rolling.is_some() {
+        0.0
+    } else {
+        (b.speed / MARCH_SPEED).clamp(0.0, 1.0)
+    };
     let s = b.stride.sin();
     let reach = if sprint { 15.0 } else { 9.5 };
     let clock = time.elapsed_secs();
     for (part, mut pt, mut vis) in &mut parts {
         match *part {
             Part::Foot(side) => {
-                let side = side as f32;
-                pt.translation.x = s * side * reach * pace;
-                pt.translation.y = 8.0 * side;
+                let sd = side as f32;
+                let shuffle = s * sd * 4.0 * pace;
+                flip(
+                    &mut pt,
+                    m(s * sd * reach * pace, -1.0 - 9.0 * sd + shuffle),
+                    -14.0,
+                    -0.6,
+                );
+                pt.translation.y = m(8.0, 10.0) * sd;
+            }
+            Part::Knee(side) => {
+                let sd = side as f32;
+                flip(&mut pt, m(4.0, 23.0) + s * sd * 2.0 * pace, 0.0, -0.3);
+                pt.translation.y = 7.5 * sd;
+                pt.scale = Vec3::splat(c);
             }
             Part::Arm(side) => {
                 let sd = side as f32;
-                // Hands in front, a sway on the walk, pumping on a sprint.
-                let swing = if sprint { 0.55 } else { 0.14 };
-                let base = -0.42 * sd;
-                let a = base - s * sd * swing * pace;
-                pt.rotation = Quat::from_rotation_z(a);
-                pt.translation.x = 1.0 + if sprint { -s * sd * 3.0 } else { 0.0 };
+                let swing = if sprint { 0.55 } else { m(0.14, 0.05) };
+                pt.rotation = Quat::from_rotation_z(m(-0.42, -0.2) * sd - s * sd * swing * pace);
+                let x = if sprint {
+                    1.0 - s * sd * 3.0
+                } else {
+                    m(1.0, 6.0)
+                };
+                flip(&mut pt, x, 8.0, 0.3);
+                pt.translation.y = m(14.0, 13.0) * sd;
             }
             Part::Torso => {
                 pt.rotation = Quat::from_rotation_z(0.07 * s * pace);
+                flip(&mut pt, m(-1.0, 3.0), 2.0, 0.0);
+                // Mid-roll it shows its back or chest, longer than the shoulders.
+                let long = cos.abs() + 1.7 * sin.abs();
+                pt.scale = vec3(m(1.0, 1.25) * long, m(1.0, 0.85), 1.0);
             }
             Part::Bag => {
                 let bob = 1.0 + 0.04 * (2.0 * b.stride).sin() * pace;
-                pt.scale = Vec3::new(bob, 1.0 / bob, 1.0);
+                pt.scale = Vec3::new(bob, 1.0 / bob, 1.0) * m(1.0, 0.92);
                 pt.rotation = Quat::from_rotation_z(-0.1 * s * pace);
+                flip(&mut pt, m(-13.0, -6.0), 6.0, 0.2);
             }
             Part::Head => {
-                pt.translation.x = if sprint { 4.5 } else { 2.0 };
+                let x = if sprint { 4.5 } else { m(2.0, 11.0) };
+                flip(&mut pt, x, 16.0, 0.5);
+                pt.scale = Vec3::splat(m(1.0, 0.9));
             }
             Part::Streak(k) => {
                 *vis = if sprint && rolling.is_none() {
@@ -292,35 +365,41 @@ fn animate(
                 let flicker = 0.6 + 0.4 * ((clock * 30.0 + k as f32 * 2.1).sin() * 0.5 + 0.5);
                 pt.scale = Vec3::new(flicker * (1.0 + 0.4 * (k as f32).abs()), 1.0, 1.0);
             }
-            Part::Shadow => {}
+            Part::Lens => {
+                *vis = if controls.torch {
+                    Visibility::Inherited
+                } else {
+                    Visibility::Hidden
+                };
+            }
         }
     }
 }
 
-/// The camera stays on the robber.
 fn follow(
     shown: Res<Shown>,
+    player: Res<Player>,
+    controls: Res<Controls>,
     mut camera: Query<&mut Transform, (With<Camera2d>, Without<Robber>)>,
     world_materials: Res<WorldMaterials>,
-    lamps: Res<crate::render::Lamps>,
+    lamps: Res<Lamps>,
     mut materials: ResMut<Assets<WorldMaterial>>,
-    time: Res<Time>,
 ) {
     if let Ok(mut c) = camera.single_mut() {
         c.translation.x = shown.pos.x;
         c.translation.y = shown.pos.y;
     }
-    // The eyes are the robber's head, where the picture stands.
-    crate::render::write_params(
+    write_params(
         shown.pos,
-        time.elapsed_secs(),
+        player.body.heading,
+        controls.torch,
+        player.body.is_crouching(),
         &world_materials,
         &lamps,
         &mut materials,
     );
 }
 
-/// The wheel zooms, eased.
 fn zoom(
     mut wheel: MessageReader<MouseWheel>,
     mut projection: Query<&mut Projection, With<Camera2d>>,
@@ -333,13 +412,19 @@ fn zoom(
     let Projection::Orthographic(ortho) = &mut *projection else {
         return;
     };
+    // Zoomed out at most to 12.5 tiles above and below the robber.
+    let most = match ortho.area.height() {
+        h if h > 0.0 => ortho.scale * 25.0 * TILE / h,
+        _ => f32::MAX,
+    };
     let goal = goal.get_or_insert(ortho.scale);
     for e in wheel.read() {
         let notches = match e.unit {
-            bevy::input::mouse::MouseScrollUnit::Line => e.y,
-            bevy::input::mouse::MouseScrollUnit::Pixel => e.y / 40.0,
+            MouseScrollUnit::Line => e.y,
+            MouseScrollUnit::Pixel => e.y / 40.0,
         };
-        *goal = (*goal * 0.88f32.powf(notches)).clamp(0.45, 2.6);
+        *goal *= 0.88f32.powf(notches);
     }
+    *goal = goal.clamp(0.45f32.min(most), most);
     ortho.scale += (*goal - ortho.scale) * approach(14.0, time.delta_secs());
 }

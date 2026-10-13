@@ -1,5 +1,4 @@
-//! A small seeded generator: splitmix64. The map is a function of its seed
-//! and nothing else, so the same seed is the same bank on every machine.
+// splitmix64: a map is a function of its seed alone, so the same seed is the same bank everywhere.
 
 #[derive(Clone, Debug)]
 pub struct Rng(u64);
@@ -21,12 +20,12 @@ impl Rng {
         (self.next_u64() >> 32) as u32
     }
 
-    /// Nought to one, one excluded.
+    /// In `0..1`.
     pub fn f32(&mut self) -> f32 {
         (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32
     }
 
-    /// `lo..hi`, `lo` when the range is empty.
+    /// In `lo..hi`, or `lo` when that is empty.
     pub fn range(&mut self, lo: i32, hi: i32) -> i32 {
         if hi <= lo {
             return lo;

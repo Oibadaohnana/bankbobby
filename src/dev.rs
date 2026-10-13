@@ -1,25 +1,20 @@
-//! Running the game with nobody at the keyboard, for checking a change:
+//! Switches for headless runs (`./hidden` runs one on a headless compositor):
 //!
-//! - `BB_SEED=n` — the map's seed (otherwise the clock's);
-//! - `BB_SMOKE_FRAMES=n` — run `n` frames and exit, each frame exactly a
-//!   sixtieth of a second, so a run plays the same every time;
-//! - `BB_SCREENSHOT=path.png` — save the frame thirty before the end;
-//! - `BB_KEYS="10:+W,40:-W,40:+D,45:Roll,60:-D"` — hold (`+`) and let go
-//!   (`-`) of W A S D Shift Up Down Left Right at those frames, or press
-//!   `Roll` once;
-//! - `BB_AIM=degrees` — aim there instead of at the pointer (0 is east,
-//!   90 north);
-//! - `BB_ZOOM=scale` — world units a pixel (0.7 by default);
-//! - `BB_WINDOW=1400x900` — the window's size;
-//! - `BB_SPAWN=x,y` — start on that tile;
-//! - `BB_UNPACED=1` — a smoke run's frames as fast as they go, the
-//!   average frame rate logged at the end.
-//!
-//! `./hidden` runs a smoke run on a headless compositor.
+//! - `BB_SEED=n`: the map's seed (else the clock's)
+//! - `BB_SMOKE_FRAMES=n`: run n frames of exactly 1/60 s each, then exit
+//! - `BB_SCREENSHOT=path.png`: save the frame 30 before the end
+//! - `BB_KEYS="10:+W,40:-W,45:Roll"`: hold (+) or let go (-) of W A S D Shift
+//!   Up Down Left Right at those frames, or press `Roll`, `Torch` or `Crouch` once
+//! - `BB_AIM=degrees`: aim there instead of at the pointer (0 east, 90 north)
+//! - `BB_ZOOM=scale`: world units a pixel (0.7)
+//! - `BB_WINDOW=1400x900`: the window's size
+//! - `BB_SPAWN=x,y`: start on that tile
+//! - `BB_UNPACED=1`: smoke frames as fast as they go, logging the average fps
 
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
 pub fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
@@ -38,7 +33,6 @@ pub fn window_size() -> (u32, u32) {
         .unwrap_or((1400, 900))
 }
 
-/// The scripted keys and aim.
 #[derive(Resource, Default)]
 pub struct Script {
     events: Vec<(u32, String)>,
@@ -87,7 +81,7 @@ impl Plugin for DevPlugin {
             .add_systems(Last, smoke);
         if smoke_frames().is_some() {
             app.insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
-                std::time::Duration::from_secs_f64(1.0 / 60.0),
+                Duration::from_secs_f64(1.0 / 60.0),
             ));
         }
     }
@@ -98,20 +92,15 @@ fn count(mut frames: ResMut<Frames>) {
 }
 
 fn play_script(frames: Res<Frames>, mut script: ResMut<Script>) {
-    script.pressed.clear();
-    let now: Vec<String> = script
-        .events
-        .iter()
-        .filter(|(f, _)| *f == frames.0)
-        .map(|(_, w)| w.clone())
-        .collect();
-    for what in now {
+    let s = &mut *script;
+    s.pressed.clear();
+    for (_, what) in s.events.iter().filter(|(f, _)| *f == frames.0) {
         if let Some(key) = what.strip_prefix('+') {
-            script.held.insert(key.to_string());
+            s.held.insert(key.to_string());
         } else if let Some(key) = what.strip_prefix('-') {
-            script.held.remove(key);
+            s.held.remove(key);
         } else {
-            script.pressed.insert(what);
+            s.pressed.insert(what.clone());
         }
     }
 }
@@ -120,32 +109,25 @@ fn smoke(
     mut commands: Commands,
     frames: Res<Frames>,
     mut exit: MessageWriter<AppExit>,
-    mut last: Local<Option<std::time::Instant>>,
-    mut warm: Local<Option<std::time::Instant>>,
+    mut last: Local<Option<Instant>>,
+    mut warm: Local<Option<Instant>>,
 ) {
-    // The frames after the shaders have compiled are the ones timed.
+    // Timed from here, once the shaders have compiled.
     const WARM: u32 = 120;
     if frames.0 == WARM {
-        *warm = Some(std::time::Instant::now());
+        *warm = Some(Instant::now());
     }
     let Some(limit) = smoke_frames() else {
         return;
     };
-    // Paced at sixty: a headless compositor has no vblank, and a frame
-    // count is only a time if the frames take one — the shaders compile
-    // in the first second.
-    // `BB_UNPACED=1` runs flat out instead, and says how fast it went.
-    let frame = std::time::Duration::from_secs_f64(1.0 / 60.0);
-    let unpaced = env("BB_UNPACED").is_some();
-    if unpaced {
-        // nothing
-    } else if let Some(at) = *last {
-        let spent = at.elapsed();
-        if spent < frame {
-            std::thread::sleep(frame - spent);
-        }
+    // Paced at 60 fps: a headless compositor has no vblank, and a frame count
+    // is only a time if each frame takes one.
+    if env("BB_UNPACED").is_none()
+        && let Some(at) = *last
+    {
+        std::thread::sleep(Duration::from_secs_f64(1.0 / 60.0).saturating_sub(at.elapsed()));
     }
-    *last = Some(std::time::Instant::now());
+    *last = Some(Instant::now());
     if frames.0 + 30 == limit
         && let Some(path) = env("BB_SCREENSHOT")
     {

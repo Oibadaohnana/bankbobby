@@ -1,18 +1,4 @@
-//! The world on screen: one material, [`WorldMaterial`], for the ground and
-//! for every mesh over it, and the three textures the ray tracer reads.
-//!
-//! The ground is one quad over the whole map, drawn by `world.wgsl` in mode
-//! 0 (its floors and walls are worked out per pixel from the tile texture).
-//! The furniture is three meshes — under the furniture, the furniture, and
-//! over the player — and the robber a handful of small ones, all in mode 1
-//! (their colours are the vertices'). Every one of them is lit and fogged
-//! per pixel by the same rays, so a desk in the dark is as dark as the
-//! floor under it.
-//!
-//! The material's parameters — where the eyes are, the lamps — change every
-//! frame and are written into each material by [`update_params`].
-
-use crate::map::{Map, Wall};
+use crate::map::Map;
 use crate::movement::TILE;
 use crate::paint;
 use bevy::asset::{RenderAssetUsages, load_internal_asset, uuid_handle};
@@ -28,13 +14,8 @@ use bevy::sprite_render::{AlphaMode2d, Material2d, Material2dKey, Material2dPlug
 
 const WORLD_SHADER: Handle<Shader> = uuid_handle!("3f6c1b2e-8d4a-4e7b-9a51-2c7d0e9b6f41");
 
-/// The most lamps a frame lights with: the nearest to the player.
+/// The most lamps a frame lights: the nearest to the player.
 pub const MAX_LIGHTS: usize = 128;
-
-/// How far the player sees: lit (`VIEW_RANGE`) and in the dark
-/// (`DARK_RANGE`), in tiles — bims' fourteen and eight.
-pub const VIEW_RANGE: f32 = 14.0;
-pub const DARK_RANGE: f32 = 8.0;
 
 pub struct RenderPlugin;
 
@@ -63,7 +44,8 @@ pub struct WorldMaterial {
     pub occ: Handle<Image>,
     #[texture(3)]
     pub extra: Handle<Image>,
-    /// Blended (the meshes, whose shadows are translucent) or not (the ground).
+    #[texture(4)]
+    pub low: Handle<Image>,
     pub blend: bool,
 }
 
@@ -80,7 +62,6 @@ impl Material2d for WorldMaterial {
         }
     }
 
-    /// No culling: a triangle is drawn whichever way round it was wound.
     fn specialize(
         descriptor: &mut RenderPipelineDescriptor,
         _layout: &MeshVertexBufferLayoutRef,
@@ -91,20 +72,17 @@ impl Material2d for WorldMaterial {
     }
 }
 
-/// Everything spawned for one map, taken down whole for the next.
 #[derive(Component)]
 pub struct WorldPart;
 
-/// The materials whose parameters follow the player.
 #[derive(Resource, Default)]
 pub struct WorldMaterials {
     pub all: Vec<Handle<WorldMaterial>>,
 }
 
-/// The map's lamps, packed for the shader.
 #[derive(Resource, Default)]
 pub struct Lamps {
-    pub all: Vec<(Vec2, Vec4, Vec4)>,
+    pub all: Vec<(Vec4, Vec4)>,
 }
 
 fn grid_image(map: &Map, texel: impl Fn(i32, i32) -> [u8; 4]) -> Image {
@@ -129,21 +107,6 @@ fn grid_image(map: &Map, texel: impl Fn(i32, i32) -> [u8; 4]) -> Image {
     image
 }
 
-fn params(map: &Map, mode: f32) -> Params {
-    Params {
-        eye: vec4(
-            map.spawn.x,
-            map.spawn.y,
-            VIEW_RANGE * TILE,
-            DARK_RANGE * TILE,
-        ),
-        map: vec4(map.w as f32, map.h as f32, TILE, 0.0),
-        misc: vec4(mode, 0.0, 0.0, 0.0),
-        lights: [Vec4::ZERO; 2 * MAX_LIGHTS],
-    }
-}
-
-/// Spawn the map: the ground, the furniture's three layers, and the lamps.
 pub fn spawn_map(
     commands: &mut Commands,
     map: &Map,
@@ -157,35 +120,37 @@ pub fn spawn_map(
         let t = map.at(x, y);
         [t.floor as u8, t.wall as u8, t.tint, t.deco]
     }));
-    let occluders = map.occluders();
-    let occ = images.add(grid_image(map, |x, y| occluders.boxes[map.idx(x, y)]));
+    let (tall, half) = (map.occluders(false), map.occluders(true));
+    let occ = images.add(grid_image(map, |x, y| tall.boxes[map.idx(x, y)]));
+    let low = images.add(grid_image(map, |x, y| half.boxes[map.idx(x, y)]));
+    let lit = map.lit();
     let extra = images.add(grid_image(map, |x, y| {
+        let i = map.idx(x, y);
+        let indoor = if map.at(x, y).indoor { 255 } else { 0 };
         [
-            occluders.objects[map.idx(x, y)],
-            if map.at(x, y).indoor { 255 } else { 0 },
-            if map.at(x, y).wall == Wall::Glass {
-                255
-            } else {
-                0
-            },
-            0,
+            tall.objects[i],
+            indoor,
+            half.objects[i],
+            if lit[i] { 255 } else { 0 },
         ]
     }));
-
-    let ground = materials.add(WorldMaterial {
-        params: params(map, 0.0),
-        tiles: tiles.clone(),
-        occ: occ.clone(),
-        extra: extra.clone(),
-        blend: false,
-    });
-    let things = materials.add(WorldMaterial {
-        params: params(map, 1.0),
-        tiles,
-        occ,
-        extra,
-        blend: true,
-    });
+    let mut material = |mode: f32| {
+        materials.add(WorldMaterial {
+            params: Params {
+                eye: vec4(map.spawn.x, map.spawn.y, 1.0, 0.0),
+                map: vec4(map.w as f32, map.h as f32, TILE, 0.0),
+                misc: vec4(mode, 0.0, 0.0, 0.0),
+                lights: [Vec4::ZERO; 2 * MAX_LIGHTS],
+            },
+            tiles: tiles.clone(),
+            occ: occ.clone(),
+            extra: extra.clone(),
+            low: low.clone(),
+            blend: mode > 0.5,
+        })
+    };
+    let ground = material(0.0);
+    let things = material(1.0);
     world_materials.all = vec![ground.clone(), things.clone()];
 
     let size = vec2(map.w as f32, map.h as f32) * TILE;
@@ -195,18 +160,18 @@ pub fn spawn_map(
         MeshMaterial2d(ground),
         Transform::from_xyz(size.x * 0.5, size.y * 0.5, 0.0),
     ));
-    let layers = paint::paint_props(&map.props);
-    for (k, layer) in layers.into_iter().enumerate() {
-        if layer.is_empty() {
-            continue;
+    for (layer, z) in paint::paint_props(&map.props)
+        .into_iter()
+        .zip([1.0, 2.0, 20.0])
+    {
+        if !layer.is_empty() {
+            commands.spawn((
+                WorldPart,
+                Mesh2d(meshes.add(layer.build())),
+                MeshMaterial2d(things.clone()),
+                Transform::from_xyz(0.0, 0.0, z),
+            ));
         }
-        let z = [1.0, 2.0, 20.0][k];
-        commands.spawn((
-            WorldPart,
-            Mesh2d(meshes.add(layer.build())),
-            MeshMaterial2d(things.clone()),
-            Transform::from_xyz(0.0, 0.0, z),
-        ));
     }
 
     lamps.all = map
@@ -214,33 +179,32 @@ pub fn spawn_map(
         .iter()
         .map(|l| {
             (
-                l.pos,
-                vec4(l.pos.x, l.pos.y, l.radius, l.intensity),
-                vec4(l.color[0], l.color[1], l.color[2], 0.0),
+                l.pos.extend(l.radius).extend(l.intensity),
+                Vec3::from(l.color).extend(0.0),
             )
         })
         .collect();
 }
 
-/// The material every mesh of the robber shares, made once a map.
 pub fn things_material(world_materials: &WorldMaterials) -> Handle<WorldMaterial> {
     world_materials.all[1].clone()
 }
 
-/// Where the eyes are and which lamps light the frame, into every material.
 pub fn write_params(
     eye: Vec2,
-    clock: f32,
+    heading: f32,
+    torch: bool,
+    crouch: bool,
     world_materials: &WorldMaterials,
     lamps: &Lamps,
     materials: &mut Assets<WorldMaterial>,
 ) {
-    let mut near: Vec<&(Vec2, Vec4, Vec4)> = lamps.all.iter().collect();
+    let mut near: Vec<_> = lamps.all.iter().collect();
     if near.len() > MAX_LIGHTS {
         near.sort_by(|a, b| {
-            a.0.distance_squared(eye)
-                .partial_cmp(&b.0.distance_squared(eye))
-                .unwrap()
+            a.0.xy()
+                .distance_squared(eye)
+                .total_cmp(&b.0.xy().distance_squared(eye))
         });
         near.truncate(MAX_LIGHTS);
     }
@@ -249,13 +213,13 @@ pub fn write_params(
             continue;
         };
         let p = &mut m.params;
-        p.eye.x = eye.x;
-        p.eye.y = eye.y;
-        p.map.w = clock;
+        p.eye = vec4(eye.x, eye.y, heading.cos(), heading.sin());
         p.misc.y = near.len() as f32;
-        for (i, lamp) in near.iter().enumerate() {
-            p.lights[2 * i] = lamp.1;
-            p.lights[2 * i + 1] = lamp.2;
+        p.misc.z = if torch { 1.0 } else { 0.0 };
+        p.misc.w = if crouch { 1.0 } else { 0.0 };
+        for (i, &&(at, colour)) in near.iter().enumerate() {
+            p.lights[2 * i] = at;
+            p.lights[2 * i + 1] = colour;
         }
     }
 }

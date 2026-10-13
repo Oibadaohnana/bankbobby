@@ -1,58 +1,28 @@
-//! How a body moves under its player's keys — bims' steering, ported.
-//!
-//! Everything here is `bims::character`'s steered walk (task 144, task 150
-//! and the October 2026 changes) with the routes, the errands and the fight
-//! taken away: WASD walk the body, the pointer turns it at once, Shift
-//! sprints, the dodge key rolls. Same numbers, same units (a tile is 52),
-//! same order of operations, so it feels the way a Bim does:
-//!
-//! - the keys get the body to its pace at `STEER_ACCEL` × `ACCEL`, and any
-//!   slowing under the keys — letting go included — is at once;
-//! - it faces the pointer at once, and walks whichever way the keys say:
-//!   away from the pointer it strides backwards at the same pace;
-//! - a sprint is `SPRINT` × the walk, eased in over `SPRINT_EASE`, and
-//!   turns the body to the way it runs at `SPRINT_TURN`;
-//! - a roll goes `ROLL_DISTANCE` in `ROLL_TIME` the way the keys walk (else
-//!   the way they last did, else the heading) and outranks everything;
-//! - collision is a push out of every solid grown by `BODY_MARGIN`, with a
-//!   lone corner rounded to `CORNER_ROUND` so a body slides round a door
-//!   frame instead of stopping on it, at its whole pace when the corner
-//!   turned it less than 60°.
-//!
-//! No Bevy in here beyond `Vec2`: it is plain arithmetic, stepped at a
-//! fixed rate, and the tests at the bottom pin the feel.
+// bims_bevy's steered walk: its numbers, units and order of operations, so it feels the same.
 
 use bevy::math::{Vec2, vec2};
 use std::f32::consts::{PI, TAU};
 
-/// A tile's side in world units (bims' `room::TILE`).
 pub const TILE: f32 = 52.0;
-/// The one march, in world units a second (bims' `balance::MARCH_SPEED`).
 pub const MARCH_SPEED: f32 = 216.0;
-/// Units a second squared, speeding up (bims' `ACCEL`).
 const ACCEL: f32 = 330.0;
-/// How much quicker the keys get a body to its pace than `ACCEL`.
+/// The keys speed a body up this many times quicker than `ACCEL`.
 const STEER_ACCEL: f32 = 4.0;
-/// How far the body's centre is kept clear of walls and furniture.
 pub const BODY_MARGIN: f32 = 23.0;
-/// A lone corner's rounding: half again the body, so it clips a corner by
-/// some five units and slides round it.
+/// A lone corner clips by some five units, so a body slides round it.
 const CORNER_ROUND: f32 = 1.5 * BODY_MARGIN;
 /// The cosine a slide round a corner may turn the walk by and keep its pace.
 const SLIDE_KEEPS_PACE: f32 = 0.5;
-/// How sharply a sprinting body turns to the way it runs.
 const SPRINT_TURN: f32 = 16.0;
-/// Sprint: a multiple of the walk, and the seconds it eases in over.
 pub const SPRINT: f32 = 1.8;
+/// Crouched against walking, as in the JS Bank Bobbery (1.9 / 3.5 tiles a second).
+pub const CROUCH: f32 = 1.9 / 3.5;
 const SPRINT_EASE: f32 = 0.1;
-/// The dodge roll: its length, its time and the wait from one to the next.
 pub const ROLL_DISTANCE: f32 = 195.0;
 pub const ROLL_TIME: f32 = 0.38;
 pub const ROLL_COOLDOWN: f32 = 1.1;
-/// The fixed step the body is moved at.
 pub const STEP: f32 = 1.0 / 60.0;
 
-/// An axis-aligned box in world units: a wall tile or a piece of furniture.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Aabb {
     pub min: Vec2,
@@ -65,10 +35,7 @@ impl Aabb {
     }
 
     pub fn expand(self, by: f32) -> Aabb {
-        Aabb {
-            min: self.min - Vec2::splat(by),
-            max: self.max + Vec2::splat(by),
-        }
+        Aabb::new(self.min - Vec2::splat(by), self.max + Vec2::splat(by))
     }
 
     pub fn contains(self, p: Vec2) -> bool {
@@ -87,7 +54,6 @@ impl Aabb {
         (self.min + self.max) * 0.5
     }
 
-    /// The point of the box nearest `p`.
     pub fn nearest(self, p: Vec2) -> Vec2 {
         vec2(
             clamp(p.x, self.min.x, self.max.x),
@@ -117,9 +83,8 @@ impl Aabb {
         })
     }
 
-    /// [`push_out`](Self::push_out) with the grown box's corners rounded to
-    /// `round` where `exposed(corner, sx, sy)` says the corner stands alone.
-    /// The flag is whether a rounded corner did the pushing.
+    /// `push_out` with the corners that `exposed(corner, sx, sy)` calls lone
+    /// rounded to `round`; the flag is whether a rounded corner pushed.
     pub fn push_out_round(
         self,
         p: Vec2,
@@ -147,8 +112,7 @@ impl Aabb {
             corner.y + sy * (radius - round),
         );
         let off = p - centre;
-        let beyond = off.x * sx > 0.0 && off.y * sy > 0.0;
-        if beyond && exposed(corner, sx, sy) {
+        if off.x * sx > 0.0 && off.y * sy > 0.0 && exposed(corner, sx, sy) {
             let d = off.length();
             if d >= round {
                 return None;
@@ -161,13 +125,11 @@ impl Aabb {
     }
 }
 
-/// What a body can bump into: the map's bounds and its solids, with a
-/// grid over them so a step looks at the few nearby and not every one.
+/// The map's bounds and solids, bucketed into a tile grid.
 pub struct Solids {
     pub bounds: Aabb,
     rects: Vec<Aabb>,
-    /// Per grid cell, the solids whose box grown by the reach of a push
-    /// touches the cell, in the order they were added.
+    /// Per cell, the solids within a push's reach, in the order added.
     cells: Vec<Vec<u32>>,
     cols: i32,
     rows: i32,
@@ -198,7 +160,6 @@ impl Solids {
         }
     }
 
-    /// The solids near `p`, in the order they were added.
     fn near(&self, p: Vec2) -> &[u32] {
         let (x, y) = cell_of(self.bounds, p);
         if x < 0 || y < 0 || x >= self.cols || y >= self.rows {
@@ -207,7 +168,6 @@ impl Solids {
         &self.cells[(y * self.cols + x) as usize]
     }
 
-    /// Whether any solid holds the point.
     pub fn solid_at(&self, p: Vec2) -> bool {
         self.near(p)
             .iter()
@@ -220,35 +180,33 @@ fn cell_of(bounds: Aabb, p: Vec2) -> (i32, i32) {
     (q.x.floor() as i32, q.y.floor() as i32)
 }
 
-/// What the player's keys and pointer say this step.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Steer {
-    /// The way the keys walk it, `None` with none down.
+    /// `None` with no walk key down.
     pub walk: Option<f32>,
-    /// Where the pointer is from the body, as an angle.
+    /// The pointer's angle from the body.
     pub aim: f32,
-    /// Shift.
     pub sprint: bool,
+    pub crouch: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 struct Roll {
     dir: f32,
     left: f32,
 }
 
-/// The player's body.
 #[derive(Clone, Debug)]
 pub struct Body {
     pub pos: Vec2,
-    /// Where it was at the start of the last step: what the picture blends from.
+    /// The position at the start of the last step, which the picture blends from.
     pub was: Vec2,
     pub heading: f32,
     pub speed: f32,
     target_speed: f32,
     /// The way the feet go.
     pub intent: f32,
-    /// The walk cycle, a phase; runs backwards for a body stepping back.
+    /// The walk cycle's phase; runs backwards while stepping back.
     pub stride: f32,
     steer: Steer,
     roll: Option<Roll>,
@@ -276,7 +234,6 @@ impl Body {
         }
     }
 
-    /// The keys and the pointer, said every step.
     pub fn set_steer(&mut self, steer: Steer) {
         if steer.walk.is_some() {
             self.last_walk = steer.walk;
@@ -285,29 +242,29 @@ impl Body {
     }
 
     pub fn is_sprinting(&self) -> bool {
-        self.steer.sprint && self.steer.walk.is_some() && self.roll.is_none()
+        self.steer.sprint && !self.steer.crouch && self.steer.walk.is_some() && self.roll.is_none()
+    }
+
+    pub fn is_crouching(&self) -> bool {
+        self.steer.crouch && self.roll.is_none()
     }
 
     pub fn is_rolling(&self) -> bool {
         self.roll.is_some()
     }
 
-    /// How far through its roll it is, nought to one.
+    /// How far through its roll it is, 0 to 1.
     pub fn roll_share(&self) -> Option<f32> {
         self.roll.map(|r| clamp(1.0 - r.left / ROLL_TIME, 0.0, 1.0))
     }
 
-    pub fn roll_dir(&self) -> Option<f32> {
-        self.roll.map(|r| r.dir)
-    }
-
-    /// The share of the cooldown still to run, nought when a roll is ready.
+    /// The share of the cooldown still to run, 0 when a roll is ready.
     pub fn roll_cooling(&self) -> f32 {
         self.roll_cool / ROLL_COOLDOWN
     }
 
-    /// A dodge roll the way the keys walk, else the way they last walked,
-    /// else the heading — never at the pointer. `true` when it rolls.
+    /// Rolls the way the keys walk, else last walked, else the heading; never
+    /// at the pointer. `true` when it rolls.
     pub fn start_roll(&mut self) -> bool {
         if self.roll.is_some() || self.roll_cool > 0.0 {
             return false;
@@ -321,7 +278,6 @@ impl Body {
         true
     }
 
-    /// One step of `dt` seconds.
     pub fn update(&mut self, dt: f32, solids: &Solids) {
         self.was = self.pos;
         self.roll_cool = (self.roll_cool - dt).max(0.0);
@@ -348,7 +304,12 @@ impl Body {
         let sprinting = self.is_sprinting();
         let goal = if let Some(walk) = steer.walk {
             self.intent = walk;
-            self.target_speed = MARCH_SPEED * if sprinting { SPRINT } else { 1.0 };
+            self.target_speed = MARCH_SPEED
+                * match (sprinting, steer.crouch) {
+                    (true, _) => SPRINT,
+                    (_, true) => CROUCH,
+                    _ => 1.0,
+                };
             walk
         } else {
             self.target_speed = 0.0;
@@ -361,8 +322,6 @@ impl Body {
             self.heading = wrap_angle(steer.aim);
         }
 
-        // Any slowing under the keys is at once; speeding up eases, and a
-        // sprint eases in from the walk over `SPRINT_EASE`.
         if self.target_speed < self.speed {
             self.speed = self.target_speed;
         } else {
@@ -378,8 +337,8 @@ impl Body {
         let from = self.pos;
         let stride = self.speed * dt;
         self.pos += along * stride;
-        // Round a lone corner at the whole pace: what the corner took off
-        // the step is given back along the way it was turned.
+        // A lone corner rounded at the whole pace: what it took off the step
+        // is given back along the way it turned the body.
         if self.keep_clear(solids) {
             let moved = self.pos - from;
             let went = moved.length();
@@ -394,26 +353,27 @@ impl Body {
         self.stride = (self.stride + if backwards { -paces } else { paces }) % TAU;
     }
 
-    /// Inside the bounds, then out of anything walked into — round a lone
-    /// corner rather than square off it. Whether a rounded corner pushed.
+    /// Clamps into the bounds and pushes out of the solids; whether a rounded
+    /// corner pushed.
     fn keep_clear(&mut self, solids: &Solids) -> bool {
         self.pos = solids.bounds.expand(-BODY_MARGIN).nearest(self.pos);
         let exposed = |c: Vec2, sx: f32, sy: f32| {
-            let e = 1.0;
-            let probes = [
-                vec2(c.x + sx * e, c.y - sy * e),
-                vec2(c.x - sx * e, c.y + sy * e),
-                vec2(c.x + sx * e, c.y + sy * e),
-            ];
-            !probes.iter().any(|&q| solids.solid_at(q))
+            ![
+                vec2(c.x + sx, c.y - sy),
+                vec2(c.x - sx, c.y + sy),
+                vec2(c.x + sx, c.y + sy),
+            ]
+            .iter()
+            .any(|&q| solids.solid_at(q))
         };
         let mut rounded = false;
-        let near: Vec<u32> = solids.near(self.pos).to_vec();
-        for i in near {
-            let solid = solids.rects[i as usize];
-            if let Some((out, round)) =
-                solid.push_out_round(self.pos, BODY_MARGIN, CORNER_ROUND, exposed)
-            {
+        for &i in solids.near(self.pos) {
+            if let Some((out, round)) = solids.rects[i as usize].push_out_round(
+                self.pos,
+                BODY_MARGIN,
+                CORNER_ROUND,
+                exposed,
+            ) {
                 self.pos += out;
                 rounded |= round;
             }
@@ -455,11 +415,8 @@ pub fn angle_lerp(a: f32, b: f32, t: f32) -> f32 {
 mod tests {
     use super::*;
 
-    fn open() -> Solids {
-        Solids::new(
-            Aabb::new(Vec2::ZERO, vec2(40.0 * TILE, 40.0 * TILE)),
-            Vec::new(),
-        )
+    fn solids(rects: Vec<Aabb>) -> Solids {
+        Solids::new(Aabb::new(Vec2::ZERO, Vec2::splat(40.0 * TILE)), rects)
     }
 
     fn tile(x: i32, y: i32) -> Aabb {
@@ -467,114 +424,90 @@ mod tests {
         Aabb::new(min, min + Vec2::splat(TILE))
     }
 
-    fn walk(body: &mut Body, solids: &Solids, angle: f32, seconds: f32) {
-        let steps = (seconds / STEP).round() as usize;
+    fn run(b: &mut Body, solids: &Solids, walk: f32, aim: f32, sprint: bool, steps: usize) {
         for _ in 0..steps {
-            body.set_steer(Steer {
-                walk: Some(angle),
-                aim: body.steer.aim,
-                sprint: body.steer.sprint,
+            b.set_steer(Steer {
+                walk: Some(walk),
+                aim,
+                sprint,
+                crouch: false,
             });
-            body.update(STEP, solids);
+            b.update(STEP, solids);
         }
     }
 
     #[test]
-    fn the_keys_reach_the_march_quickly_and_stop_at_once() {
-        let solids = open();
+    fn walk_sprint_and_stop() {
+        let open = solids(Vec::new());
         let mut b = Body::new(vec2(500.0, 500.0), 0.0);
-        walk(&mut b, &solids, 0.0, 0.25);
+        run(&mut b, &open, 0.0, 0.0, false, 15);
         assert!((b.speed - MARCH_SPEED).abs() < 1e-3, "{}", b.speed);
         b.set_steer(Steer::default());
         let at = b.pos;
-        b.update(STEP, &solids);
-        assert_eq!(b.speed, 0.0);
-        assert_eq!(b.pos, at);
-    }
+        b.update(STEP, &open);
+        assert_eq!((b.speed, b.pos), (0.0, at));
 
-    #[test]
-    fn a_body_faces_the_pointer_at_once_and_strides_back_walking_away() {
-        let solids = open();
+        // Faces the pointer at once and strides backwards walking away from it.
         let mut b = Body::new(vec2(500.0, 500.0), 0.0);
-        b.set_steer(Steer {
-            walk: Some(PI),
-            aim: 0.0,
-            sprint: false,
-        });
-        for _ in 0..30 {
-            b.update(STEP, &solids);
-        }
+        run(&mut b, &open, PI, 0.0, false, 30);
         assert_eq!(b.heading, 0.0);
-        assert!(b.pos.x < 500.0);
-        assert!(b.stride < 0.0, "{}", b.stride);
-    }
+        assert!(
+            b.pos.x < 500.0 && b.stride < 0.0,
+            "{:?} {}",
+            b.pos,
+            b.stride
+        );
 
-    #[test]
-    fn a_sprint_is_quicker_and_faces_the_run() {
-        let solids = open();
         let mut b = Body::new(vec2(500.0, 500.0), 0.0);
-        b.set_steer(Steer {
-            walk: Some(PI / 2.0),
-            aim: 0.0,
-            sprint: true,
-        });
-        for _ in 0..60 {
-            b.update(STEP, &solids);
-        }
+        run(&mut b, &open, PI / 2.0, 0.0, true, 60);
         assert!((b.speed - MARCH_SPEED * SPRINT).abs() < 1e-3);
         assert!((b.heading - PI / 2.0).abs() < 0.01, "{}", b.heading);
+
+        // A crouch walks slower and will not sprint.
+        b.set_steer(Steer {
+            walk: Some(0.0),
+            sprint: true,
+            crouch: true,
+            ..Steer::default()
+        });
+        b.update(STEP, &open);
+        assert!(!b.is_sprinting() && (b.speed - MARCH_SPEED * CROUCH).abs() < 1e-3);
     }
 
     #[test]
     fn a_roll_goes_its_distance_the_way_the_keys_walked_and_cools_down() {
-        let solids = open();
+        let open = solids(Vec::new());
         let mut b = Body::new(vec2(500.0, 500.0), 0.0);
-        b.set_steer(Steer {
-            walk: Some(PI / 2.0),
-            aim: 0.0,
-            sprint: false,
-        });
-        b.update(STEP, &solids);
+        run(&mut b, &open, PI / 2.0, 0.0, false, 1);
         b.set_steer(Steer::default());
         let from = b.pos;
         assert!(b.start_roll());
         while b.is_rolling() {
-            b.update(STEP, &solids);
+            b.update(STEP, &open);
         }
         let went = b.pos - from;
-        assert!((went.y - ROLL_DISTANCE).abs() < 0.5, "{went:?}");
-        assert!(went.x.abs() < 1e-3);
+        assert!(
+            (went.y - ROLL_DISTANCE).abs() < 0.5 && went.x.abs() < 1e-3,
+            "{went:?}"
+        );
         assert!(!b.start_roll());
     }
 
     #[test]
     fn a_lone_corner_is_slid_round_and_a_wall_of_tiles_has_no_seams() {
-        // A pillar a tile square: walked at a few units off its edge, the
-        // body comes round it rather than stopping.
-        let solids = Solids::new(
-            Aabb::new(Vec2::ZERO, vec2(40.0 * TILE, 40.0 * TILE)),
-            vec![tile(10, 10)],
-        );
+        let pillar = solids(vec![tile(10, 10)]);
         let mut b = Body::new(
             vec2(10.0 * TILE - 200.0, 11.0 * TILE + BODY_MARGIN - 6.0),
             0.0,
         );
-        walk(&mut b, &solids, 0.0, 2.0);
+        run(&mut b, &pillar, 0.0, 0.0, false, 120);
         assert!(b.pos.x > 11.0 * TILE + BODY_MARGIN, "{:?}", b.pos);
 
-        // A wall of tiles: sliding along it keeps a straight line.
-        let wall: Vec<Aabb> = (0..20).map(|x| tile(x, 5)).collect();
-        let solids = Solids::new(Aabb::new(Vec2::ZERO, vec2(40.0 * TILE, 40.0 * TILE)), wall);
+        let wall = solids((0..20).map(|x| tile(x, 5)).collect());
         let y = 6.0 * TILE + BODY_MARGIN;
         let mut b = Body::new(vec2(TILE, y), 0.0);
-        // Pressed into the wall at a slant: it slides along, never caught.
         for _ in 0..120 {
-            b.set_steer(Steer {
-                walk: Some(-0.3),
-                aim: 0.0,
-                sprint: false,
-            });
-            b.update(STEP, &solids);
+            run(&mut b, &wall, -0.3, 0.0, false, 1);
             assert!((b.pos.y - y).abs() < 1e-3, "{:?}", b.pos);
         }
         assert!(b.pos.x > TILE + 300.0);

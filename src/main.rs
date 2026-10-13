@@ -1,13 +1,3 @@
-//! Bank Bobbery — on foot, at night, round a bank nobody has built before.
-//!
-//! The movement is bims_bevy's steered walk (`movement.rs`), the bank is
-//! generated from a seed (`map.rs`), and what the robber sees — and what
-//! the lamps light — is ray traced per pixel through the bank's walls and
-//! furniture (`shaders/world.wgsl`). No gameplay yet: walk, sprint, roll.
-//!
-//! WASD walk, the mouse aims, Shift sprints, Space (or Alt) rolls, the
-//! wheel zooms, R builds a new bank, F11 is full screen.
-
 mod dev;
 mod map;
 mod movement;
@@ -27,11 +17,9 @@ use crate::movement::{Body, Solids};
 use crate::player::{Player, PlayerPlugin, spawn_robber};
 use crate::render::{Lamps, RenderPlugin, WorldMaterial, WorldMaterials, WorldPart};
 
-/// The map to build next, if one is asked for.
 #[derive(Resource)]
 struct NewMap(Option<u64>);
 
-/// The map on show.
 #[derive(Resource)]
 struct Current {
     seed: u64,
@@ -169,7 +157,6 @@ fn build_map(
         &mut world_materials,
         &mut lamps,
     );
-    // `BB_SPAWN=x,y`: start on that tile instead, for a look round.
     let spawn = dev::env("BB_SPAWN")
         .and_then(|v| {
             let (x, y) = v.split_once(',')?;
@@ -185,26 +172,30 @@ fn build_map(
     commands.insert_resource(Player {
         body: Body::new(spawn, std::f32::consts::FRAC_PI_2),
         solids: Solids::new(map.bounds(), map.solids()),
+        cover: map
+            .props
+            .iter()
+            .filter(|p| p.kind.is_low())
+            .map(|p| p.body)
+            .collect(),
     });
-    commands.insert_resource(Current {
+    let current = Current {
         seed,
         rooms: map.rooms.len(),
         props: map.props.len(),
         lamps: map.lights.len(),
-    });
+    };
     info!(
         "bank {seed}: {}x{} tiles, {} rooms, {} props, {} lamps",
-        map.w,
-        map.h,
-        map.rooms.len(),
-        map.props.len(),
-        map.lights.len()
+        map.w, map.h, current.rooms, current.props, current.lamps
     );
+    commands.insert_resource(current);
 }
 
 fn hud(
     current: Option<Res<Current>>,
     player: Option<Res<Player>>,
+    controls: Res<player::Controls>,
     diagnostics: Res<DiagnosticsStore>,
     mut text: Query<&mut Text, With<Hud>>,
 ) {
@@ -218,6 +209,10 @@ fn hud(
     let b = &player.body;
     let state = if b.is_rolling() {
         "rolling"
+    } else if player.in_cover() {
+        "crouching, in cover"
+    } else if b.is_crouching() {
+        "crouching"
     } else if b.is_sprinting() {
         "sprinting"
     } else if b.speed > 1.0 {
@@ -225,6 +220,7 @@ fn hud(
     } else {
         "standing"
     };
+    let torch = if controls.torch { "on" } else { "off" };
     let roll = if b.roll_cooling() > 0.0 {
         "cooling"
     } else {
@@ -232,8 +228,8 @@ fn hud(
     };
     text.0 = format!(
         "BANK BOBBERY   bank #{}  ({} rooms, {} props, {} lamps)   {:.0} fps\n\
-         WASD walk | mouse aim | Shift sprint | Space/Alt roll | wheel zoom | R new bank | F11 full screen\n\
-         {state}   roll {roll}",
+         WASD walk | mouse aim | Shift sprint | C crouch | Space/Alt roll | T flashlight | wheel zoom | R new bank | F11 full screen\n\
+         {state}   roll {roll}   flashlight {torch}",
         current.seed, current.rooms, current.props, current.lamps, fps
     );
 }
