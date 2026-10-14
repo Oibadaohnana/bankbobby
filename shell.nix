@@ -25,6 +25,8 @@ pkgs.mkShell {
     # The headless compositor `./hidden` opens a window on.
     weston
   ];
-  buildInputs = runtimeLibs;
+  # ALSA is linked, not opened at run time: cpal, under Bevy's audio, finds
+  # it through pkg-config, so `cargo build` wants it too.
+  buildInputs = runtimeLibs ++ [ pkgs.alsa-lib ];
   LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath runtimeLibs;
 }

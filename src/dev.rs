@@ -1,14 +1,16 @@
 //! Switches for headless runs (`./hidden` runs one on a headless compositor):
 //!
 //! - `BB_SEED=n`: the map's seed (else the clock's)
-//! - `BB_SMOKE_FRAMES=n`: run n frames of exactly 1/60 s each, then exit
+//! - `BB_SMOKE_FRAMES=n`: run n frames of exactly 1/60 s each, then exit, silently
 //! - `BB_SCREENSHOT=path.png`: save the frame 30 before the end
 //! - `BB_KEYS="10:+W,40:-W,45:Roll"`: hold (+) or let go (-) of W A S D Shift
-//!   Up Down Left Right at those frames, or press `Roll`, `Torch` or `Crouch` once
+//!   Up Down Left Right at those frames, or press `Roll`, `Torch`, `Crouch`,
+//!   `Inventory`, `Slot1`–`Slot4` or `Smash`, `Throw` or `Fire` (a left click), `Use` (E) or `Reload` once
 //! - `BB_AIM=degrees`: aim there instead of at the pointer (0 east, 90 north)
 //! - `BB_ZOOM=scale`: world units a pixel (0.7)
 //! - `BB_WINDOW=1400x900`: the window's size
 //! - `BB_SPAWN=x,y`: start on that tile
+//! - `BB_GUARD=x,y`: the guard starts on that tile (else in the security room)
 //! - `BB_UNPACED=1`: smoke frames as fast as they go, logging the average fps
 
 use bevy::prelude::*;
@@ -18,6 +20,13 @@ use std::time::{Duration, Instant};
 
 pub fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
+}
+
+/// A tile's centre from "x,y".
+pub fn tile(name: &str) -> Option<Vec2> {
+    let v = env(name)?;
+    let (x, y) = v.split_once(',')?;
+    Some(crate::map::tile_centre(x.parse().ok()?, y.parse().ok()?))
 }
 
 pub fn smoke_frames() -> Option<u32> {

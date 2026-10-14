@@ -17,6 +17,8 @@ const SPRINT_TURN: f32 = 16.0;
 pub const SPRINT: f32 = 1.8;
 /// Crouched against walking, as in the JS Bank Bobbery (1.9 / 3.5 tiles a second).
 pub const CROUCH: f32 = 1.9 / 3.5;
+/// Wading through plants, against the open floor (not bims').
+pub const THICK: f32 = 0.5;
 const SPRINT_EASE: f32 = 0.1;
 pub const ROLL_DISTANCE: f32 = 195.0;
 pub const ROLL_TIME: f32 = 0.38;
@@ -188,6 +190,8 @@ pub struct Steer {
     pub aim: f32,
     pub sprint: bool,
     pub crouch: bool,
+    /// In a thicket: `THICK` the pace.
+    pub thick: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -309,7 +313,8 @@ impl Body {
                     (true, _) => SPRINT,
                     (_, true) => CROUCH,
                     _ => 1.0,
-                };
+                }
+                * if steer.thick { THICK } else { 1.0 };
             walk
         } else {
             self.target_speed = 0.0;
@@ -430,7 +435,7 @@ mod tests {
                 walk: Some(walk),
                 aim,
                 sprint,
-                crouch: false,
+                ..Steer::default()
             });
             b.update(STEP, solids);
         }
@@ -472,6 +477,15 @@ mod tests {
         });
         b.update(STEP, &open);
         assert!(!b.is_sprinting() && (b.speed - MARCH_SPEED * CROUCH).abs() < 1e-3);
+
+        // Into plants, the pace halves at once.
+        b.set_steer(Steer {
+            walk: Some(0.0),
+            thick: true,
+            ..Steer::default()
+        });
+        b.update(STEP, &open);
+        assert!((b.speed - MARCH_SPEED * THICK).abs() < 1e-3, "{}", b.speed);
     }
 
     #[test]

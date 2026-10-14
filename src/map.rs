@@ -40,6 +40,8 @@ pub mod deco {
     pub const ZEBRA: u8 = 8;
     pub const VAULT_DOOR: u8 = 16;
     pub const RUG: u8 = 32;
+    /// A smashed window: glass on the floor, the frame's posts at its ends.
+    pub const SHARDS: u8 = 64;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -53,6 +55,24 @@ pub struct Tile {
 }
 
 pub const NO_ROOM: u16 = u16::MAX;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DoorKind {
+    Wood,
+    Steel,
+    Glass,
+}
+
+/// One leaf in a doorway: it swings about `hinge`, lying along `along` shut.
+#[derive(Clone, Copy, Debug)]
+pub struct Door {
+    pub x: i32,
+    pub y: i32,
+    pub hinge: Vec2,
+    pub along: Vec2,
+    pub across: Vec2,
+    pub kind: DoorKind,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RoomKind {
@@ -106,7 +126,15 @@ impl PropKind {
     /// Cover for a crouched body, and in the way of its eyes.
     pub fn is_low(self) -> bool {
         use PropKind::*;
-        matches!(self, Desk | BigDesk | MonitorDesk | Table | Counter | Sofa)
+        matches!(
+            self,
+            Desk | BigDesk | MonitorDesk | Table | Counter | Sofa | Car
+        )
+    }
+
+    /// Thick enough to walk into and hide in.
+    pub fn is_hideout(self) -> bool {
+        self == PropKind::Thicket
     }
 }
 
@@ -118,6 +146,10 @@ pub enum PropKind {
     Cabinet,
     Bookshelf,
     Plant,
+    /// A potted palm, its fronds over whoever passes.
+    BigPlant,
+    /// A planter of tall, dense plants along a wall, to hide in.
+    Thicket,
     Pillar,
     Bench,
     Counter,
@@ -203,6 +235,8 @@ fn spec(kind: PropKind) -> Spec {
         Cabinet => s(true, 7.0, 32.0, true, true),
         Bookshelf => s(true, 2.0, 22.0, true, true),
         Plant => s(false, 12.0, 28.0, true, false),
+        BigPlant => s(false, 10.0, 32.0, true, false),
+        Thicket => s(true, 0.0, TILE, false, false),
         Pillar => s(false, 6.0, 40.0, true, true),
         Bench => s(false, 4.0, 22.0, true, false),
         Counter => s(false, 0.0, 30.0, true, false),
@@ -298,8 +332,74 @@ impl Map {
         &mut self.tiles[i]
     }
 
+    /// Breaks a window: it becomes an opening with glass on the floor.
+    pub fn smash(&mut self, x: i32, y: i32) {
+        let t = self.at_mut(x, y);
+        t.wall = Wall::None;
+        t.deco |= deco::SHARDS;
+    }
+
     pub fn is_wall(&self, x: i32, y: i32) -> bool {
         self.inside(x, y) && self.at(x, y).wall != Wall::None
+    }
+
+    /// A leaf per doorway tile (the vault's is its round door), hinged at the
+    /// outer ends of a run: the main entrance in glass, the outer wall's in
+    /// steel, the rest in wood.
+    pub fn doors(&self) -> Vec<Door> {
+        let door = |x: i32, y: i32| {
+            self.inside(x, y) && self.at(x, y).deco & (deco::DOOR | deco::VAULT_DOOR) == deco::DOOR
+        };
+        let mut out = Vec::new();
+        for y in 0..self.h {
+            for x in 0..self.w {
+                if !door(x, y) {
+                    continue;
+                }
+                let flat = self.is_wall(x - 1, y)
+                    || self.is_wall(x + 1, y)
+                    || door(x - 1, y)
+                    || door(x + 1, y);
+                let (dx, dy) = if flat { (1, 0) } else { (0, 1) };
+                let mut i = 0;
+                while door(x - dx * (i + 1), y - dy * (i + 1)) {
+                    i += 1;
+                }
+                let mut n = i + 1;
+                while door(x + dx * (n - i), y + dy * (n - i)) {
+                    n += 1;
+                }
+                let end = self.at(x - dx * (i + 1), y - dy * (i + 1)).wall;
+                let kind = match (n, end) {
+                    (3.., _) => DoorKind::Glass,
+                    (_, Wall::Brick) => DoorKind::Steel,
+                    _ => DoorKind::Wood,
+                };
+                let along = vec2(dx as f32, dy as f32);
+                let low = i < n / 2;
+                let reach = TILE * 0.5 - 1.5;
+                let centre = tile_centre(x, y);
+                out.push(Door {
+                    x,
+                    y,
+                    hinge: centre + along * if low { -reach } else { reach },
+                    along: if low { along } else { -along },
+                    across: vec2(-along.y, along.x),
+                    kind,
+                });
+            }
+        }
+        out
+    }
+
+    /// Per tile: no wall and no solid prop on it, so a body fits at its centre.
+    pub fn free(&self) -> Vec<bool> {
+        let used = used_tiles(self);
+        self.tiles
+            .iter()
+            .zip(used)
+            .map(|(t, u)| t.wall == Wall::None && !u)
+            .collect()
     }
 
     pub fn bounds(&self) -> Aabb {
@@ -388,6 +488,19 @@ fn used_tiles(map: &Map) -> Vec<bool> {
         }
     }
     used
+}
+
+/// The tiles just in front of a block facing `face`.
+fn front_of(x: i32, y: i32, w: i32, h: i32, face: Face) -> Vec<(i32, i32)> {
+    let (fx, fy, fw, fh) = match face {
+        NORTH => (x, y + h, w, 1),
+        SOUTH => (x, y - 1, w, 1),
+        EAST => (x + w, y, 1, h),
+        _ => (x - 1, y, 1, h),
+    };
+    (fy..fy + fh)
+        .flat_map(|y| (fx..fx + fw).map(move |x| (x, y)))
+        .collect()
 }
 
 pub fn tile_box(x: i32, y: i32) -> Aabb {
@@ -1113,7 +1226,9 @@ impl Gen {
     }
 
     /// A prop on `w` × `h` tiles from `(x, y)`, if they are free.
-    /// Decoration goes anywhere.
+    /// Decoration goes anywhere. A piece against a wall keeps the row in
+    /// front of it open, or a body could not reach it, and the floor its
+    /// shallow block leaves would be a pocket too tight to step into.
     #[allow(clippy::too_many_arguments)]
     fn place(
         &mut self,
@@ -1125,8 +1240,27 @@ impl Gen {
         face: Face,
         room: u16,
     ) -> bool {
-        if spec(kind).solid && !self.free(x, y, w, h, room) {
+        let s = spec(kind);
+        let hideout = kind.is_hideout();
+        if (s.solid || hideout) && !self.free(x, y, w, h, room) {
             return false;
+        }
+        // Walked into, but nothing else goes there.
+        if hideout {
+            self.keep_free(x, y, x + w - 1, y + h - 1);
+        }
+        if s.solid && s.backed {
+            let front = front_of(x, y, w, h, face);
+            let open = |&(x, y): &(i32, i32)| {
+                self.map.inside(x, y) && !self.map.is_wall(x, y) && !self.used[self.map.idx(x, y)]
+            };
+            if !front.iter().all(open) {
+                return false;
+            }
+            for (x, y) in front {
+                let i = self.map.idx(x, y);
+                self.clear[i] = true;
+            }
         }
         self.put(kind, x, y, w, h, face, room);
         true
@@ -1223,6 +1357,7 @@ impl Gen {
                 RoomKind::Lobby => self.furnish_lobby(id),
                 RoomKind::Corridor => {
                     self.along_walls(Plant, id, 1, (r.w() / 12) as usize);
+                    self.along_walls(Thicket, id, 2, (r.w() / 20) as usize);
                     self.along_walls(Cooler, id, 1, 1);
                     self.along_walls(Bin, id, 1, 1);
                 }
@@ -1235,7 +1370,9 @@ impl Gen {
                             }
                         }
                     }
+                    self.in_corners(BigPlant, id, 1);
                     self.in_corners(Plant, id, 2);
+                    self.along_walls(Thicket, id, 2, 1);
                     self.along_walls(Copier, id, 1, 1);
                     self.along_walls(Cabinet, id, 1, 2);
                 }
@@ -1259,6 +1396,7 @@ impl Gen {
                     self.along_walls(Bookshelf, id, 2, 2);
                     self.along_walls(Sofa, id, 2, 1);
                     self.along_walls(Safe, id, 1, 1);
+                    self.in_corners(BigPlant, id, 1);
                     self.in_corners(Plant, id, 2);
                 }
                 RoomKind::Break => {
@@ -1276,6 +1414,7 @@ impl Gen {
                     }
                     self.along_walls(SinkCounter, id, 2, 1);
                     self.along_walls(Fridge, id, 1, 1);
+                    self.in_corners(BigPlant, id, 1);
                     self.along_walls(Vending, id, 1, 1);
                     self.along_walls(Cooler, id, 1, 1);
                 }
@@ -1352,7 +1491,9 @@ impl Gen {
         }
         self.along_walls(PropKind::Atm, id, 1, 2);
         self.along_walls(PropKind::Bench, id, 2, 2);
+        self.in_corners(PropKind::BigPlant, id, 2);
         self.in_corners(PropKind::Plant, id, 2);
+        self.along_walls(PropKind::Thicket, id, 2, 2);
         let mut x = r.x0 + 1;
         while x < r.x1 {
             let kind = if self.rng.chance(0.15) {
@@ -1504,6 +1645,28 @@ mod tests {
         assert_eq!((a.w, a.props.len(), a.spawn), (b.w, b.props.len(), b.spawn));
         for s in a.solids() {
             assert!(!s.expand(BODY_MARGIN - 1.0).contains(a.spawn), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn every_wall_piece_can_be_walked_up_to() {
+        for seed in 0..20 {
+            let map = generate(seed);
+            let free = map.free();
+            for p in map.props.iter().filter(|p| p.solid && spec(p.kind).backed) {
+                let (x, y) = tile_of(p.block.min);
+                let (w, h) = (
+                    (p.block.width() / TILE) as i32,
+                    (p.block.height() / TILE) as i32,
+                );
+                for (fx, fy) in front_of(x, y, w, h, p.face) {
+                    assert!(
+                        free[map.idx(fx, fy)],
+                        "seed {seed}: {:?} at {x},{y} blocked",
+                        p.kind
+                    );
+                }
+            }
         }
     }
 

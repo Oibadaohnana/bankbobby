@@ -1,10 +1,21 @@
 mod dev;
+mod doors;
+mod guard;
+mod guns;
+mod hearing;
+mod inventory;
+mod inventory_ui;
 mod map;
 mod movement;
 mod paint;
 mod player;
+mod prompt;
 mod render;
 mod rng;
+mod sight;
+mod smash;
+mod sound;
+mod throw;
 
 use bevy::camera::Hdr;
 use bevy::core_pipeline::tonemapping::Tonemapping;
@@ -52,7 +63,20 @@ fn main() {
             ..default()
         }))
         .add_plugins(FrameTimeDiagnosticsPlugin::default())
-        .add_plugins((RenderPlugin, PlayerPlugin, dev::DevPlugin))
+        .add_plugins((
+            RenderPlugin,
+            PlayerPlugin,
+            doors::DoorsPlugin,
+            guard::GuardPlugin,
+            sound::SoundPlugin,
+            hearing::HearingPlugin,
+            inventory_ui::InventoryUiPlugin,
+            smash::SmashPlugin,
+            throw::ThrowPlugin,
+            prompt::PromptPlugin,
+            guns::GunsPlugin,
+            dev::DevPlugin,
+        ))
         .insert_resource(ClearColor(Color::srgb(0.01, 0.012, 0.02)))
         .insert_resource(NewMap(Some(seed)))
         .init_resource::<WorldMaterials>()
@@ -111,7 +135,7 @@ fn keys(
     mut new_map: ResMut<NewMap>,
     mut window: Query<&mut Window>,
 ) {
-    if input.just_pressed(KeyCode::KeyR) {
+    if input.just_pressed(KeyCode::F5) {
         let next = current.map_or(1, |c| {
             c.seed
                 .wrapping_mul(6364136223846793005)
@@ -157,12 +181,21 @@ fn build_map(
         &mut world_materials,
         &mut lamps,
     );
-    let spawn = dev::env("BB_SPAWN")
-        .and_then(|v| {
-            let (x, y) = v.split_once(',')?;
-            Some(map::tile_centre(x.parse().ok()?, y.parse().ok()?))
-        })
-        .unwrap_or(map.spawn);
+    doors::spawn_doors(
+        &mut commands,
+        &mut meshes,
+        render::things_material(&world_materials),
+        &map,
+    );
+    guard::spawn_guard(
+        &mut commands,
+        &mut meshes,
+        render::things_material(&world_materials),
+        render::ghost_material(&world_materials),
+        &map,
+    );
+    commands.insert_resource(sight::Sight::new(&map));
+    let spawn = dev::tile("BB_SPAWN").unwrap_or(map.spawn);
     spawn_robber(
         &mut commands,
         &mut meshes,
@@ -178,6 +211,12 @@ fn build_map(
             .filter(|p| p.kind.is_low())
             .map(|p| p.body)
             .collect(),
+        hideouts: map
+            .props
+            .iter()
+            .filter(|p| p.kind.is_hideout())
+            .map(|p| p.block)
+            .collect(),
     });
     let current = Current {
         seed,
@@ -190,12 +229,19 @@ fn build_map(
         map.w, map.h, current.rooms, current.props, current.lamps
     );
     commands.insert_resource(current);
+    commands.insert_resource(smash::Bank(map));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn hud(
     current: Option<Res<Current>>,
     player: Option<Res<Player>>,
     controls: Res<player::Controls>,
+    order: Res<guard::Order>,
+    spotted: Res<guard::Spotted>,
+    heard: Res<guard::Heard>,
+    gun: Res<guns::Gunplay>,
+    inventory: Res<inventory::Inventory>,
     diagnostics: Res<DiagnosticsStore>,
     mut text: Query<&mut Text, With<Hud>>,
 ) {
@@ -209,6 +255,8 @@ fn hud(
     let b = &player.body;
     let state = if b.is_rolling() {
         "rolling"
+    } else if player.hidden() {
+        "hidden in the plants"
     } else if player.in_cover() {
         "crouching, in cover"
     } else if b.is_crouching() {
@@ -226,10 +274,30 @@ fn hud(
     } else {
         "ready"
     };
+    let guard = match (order.0, spotted.0) {
+        (true, _) => "   click where the guard goes",
+        (_, true) => "   THE GUARD SEES YOU",
+        _ if heard.0 => "   the guard heard something",
+        _ => "",
+    };
+    let pistol = match inventory.held().map(|i| &inventory.items[i]) {
+        Some(p) if p.kind == inventory::Kind::Pistol => {
+            let spare: u32 = inventory
+                .items
+                .iter()
+                .filter(|i| i.kind == inventory::Kind::Rounds)
+                .map(|i| i.count)
+                .sum();
+            let state = if gun.reload > 0.0 { "  reloading" } else { "" };
+            format!("   pistol {} | {spare}{state}", p.count)
+        }
+        _ => String::new(),
+    };
     text.0 = format!(
         "BANK BOBBERY   bank #{}  ({} rooms, {} props, {} lamps)   {:.0} fps\n\
-         WASD walk | mouse aim | Shift sprint | C crouch | Space/Alt roll | T flashlight | wheel zoom | R new bank | F11 full screen\n\
-         {state}   roll {roll}   flashlight {torch}",
-        current.seed, current.rooms, current.props, current.lamps, fps
+         WASD walk | mouse aim | Shift sprint | C crouch | Space/Alt roll | F flashlight | Tab inventory | 1-4 quick slots\n\
+         E knock out from behind | T then click send the guard | R reload | wheel zoom | F5 new bank | F11 full screen\n\
+         health {}/3   {state}   roll {roll}   flashlight {torch}{pistol}{guard}",
+        current.seed, current.rooms, current.props, current.lamps, fps, gun.health
     );
 }

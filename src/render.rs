@@ -1,4 +1,4 @@
-use crate::map::Map;
+use crate::map::{DoorKind, Map};
 use crate::movement::TILE;
 use crate::paint;
 use bevy::asset::{RenderAssetUsages, load_internal_asset, uuid_handle};
@@ -31,6 +31,7 @@ pub struct Params {
     pub eye: Vec4,
     pub map: Vec4,
     pub misc: Vec4,
+    pub guard: Vec4,
     pub lights: [Vec4; 2 * MAX_LIGHTS],
 }
 
@@ -46,6 +47,10 @@ pub struct WorldMaterial {
     pub extra: Handle<Image>,
     #[texture(4)]
     pub low: Handle<Image>,
+    #[texture(5)]
+    pub doors: Handle<Image>,
+    #[texture(6)]
+    pub heard: Handle<Image>,
     pub blend: bool,
 }
 
@@ -78,6 +83,12 @@ pub struct WorldPart;
 #[derive(Resource, Default)]
 pub struct WorldMaterials {
     pub all: Vec<Handle<WorldMaterial>>,
+    /// Per tile: floor, wall, tint, deco. Rewritten as windows are smashed.
+    pub tiles: Handle<Image>,
+    /// Per doorway tile: how shut (r), lying along x (g), glass (b). Rewritten as doors swing.
+    pub doors: Handle<Image>,
+    /// Per tile, a smash's reach: sixteenths of a tile left (r), how strongly shown (g). Rewritten every frame.
+    pub heard: Handle<Image>,
 }
 
 #[derive(Resource, Default)]
@@ -116,13 +127,34 @@ pub fn spawn_map(
     world_materials: &mut WorldMaterials,
     lamps: &mut Lamps,
 ) {
-    let tiles = images.add(grid_image(map, |x, y| {
+    let mut tiles = grid_image(map, |x, y| {
         let t = map.at(x, y);
         [t.floor as u8, t.wall as u8, t.tint, t.deco]
-    }));
+    });
+    tiles.asset_usage = RenderAssetUsages::default();
+    let tiles = images.add(tiles);
+    world_materials.tiles = tiles.clone();
     let (tall, half) = (map.occluders(false), map.occluders(true));
     let occ = images.add(grid_image(map, |x, y| tall.boxes[map.idx(x, y)]));
     let low = images.add(grid_image(map, |x, y| half.boxes[map.idx(x, y)]));
+    let mut shut = vec![[0u8; 4]; map.tiles.len()];
+    for d in map.doors() {
+        let glass = d.kind == DoorKind::Glass;
+        shut[map.idx(d.x, d.y)] = [
+            255,
+            if d.along.x != 0.0 { 255 } else { 0 },
+            if glass { 255 } else { 0 },
+            0,
+        ];
+    }
+    let mut doors = grid_image(map, |x, y| shut[map.idx(x, y)]);
+    doors.asset_usage = RenderAssetUsages::default();
+    let doors = images.add(doors);
+    world_materials.doors = doors.clone();
+    let mut heard = grid_image(map, |_, _| [0; 4]);
+    heard.asset_usage = RenderAssetUsages::default();
+    let heard = images.add(heard);
+    world_materials.heard = heard.clone();
     let lit = map.lit();
     let extra = images.add(grid_image(map, |x, y| {
         let i = map.idx(x, y);
@@ -140,18 +172,21 @@ pub fn spawn_map(
                 eye: vec4(map.spawn.x, map.spawn.y, 1.0, 0.0),
                 map: vec4(map.w as f32, map.h as f32, TILE, 0.0),
                 misc: vec4(mode, 0.0, 0.0, 0.0),
+                guard: Vec4::ZERO,
                 lights: [Vec4::ZERO; 2 * MAX_LIGHTS],
             },
             tiles: tiles.clone(),
             occ: occ.clone(),
             extra: extra.clone(),
             low: low.clone(),
+            doors: doors.clone(),
+            heard: heard.clone(),
             blend: mode > 0.5,
         })
     };
     let ground = material(0.0);
     let things = material(1.0);
-    world_materials.all = vec![ground.clone(), things.clone()];
+    world_materials.all = vec![ground.clone(), things.clone(), material(2.0)];
 
     let size = vec2(map.w as f32, map.h as f32) * TILE;
     commands.spawn((
@@ -190,11 +225,18 @@ pub fn things_material(world_materials: &WorldMaterials) -> Handle<WorldMaterial
     world_materials.all[1].clone()
 }
 
+pub fn ghost_material(world_materials: &WorldMaterials) -> Handle<WorldMaterial> {
+    world_materials.all[2].clone()
+}
+
+/// `guard`: his eye and the way he faces (cos, sin); zero for none.
+#[allow(clippy::too_many_arguments)]
 pub fn write_params(
     eye: Vec2,
     heading: f32,
     torch: bool,
     crouch: bool,
+    guard: Vec4,
     world_materials: &WorldMaterials,
     lamps: &Lamps,
     materials: &mut Assets<WorldMaterial>,
@@ -217,6 +259,7 @@ pub fn write_params(
         p.misc.y = near.len() as f32;
         p.misc.z = if torch { 1.0 } else { 0.0 };
         p.misc.w = if crouch { 1.0 } else { 0.0 };
+        p.guard = guard;
         for (i, &&(at, colour)) in near.iter().enumerate() {
             p.lights[2 * i] = at;
             p.lights[2 * i + 1] = colour;

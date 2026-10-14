@@ -1,4 +1,4 @@
-// The ground (mode 0) and every mesh over it (mode 1), lit per pixel by lamps
+// The ground (mode 0), every mesh over it (mode 1) and ghosts (mode 2), lit per pixel by lamps
 // and the flashlight, each shadowed by rays traced through the tile grid.
 // Sight is a range, not a ray: no rays are traced from the eye.
 
@@ -7,7 +7,8 @@
 struct Params {
     eye: vec4<f32>, // the robber xy, the way he faces (cos, sin)
     map: vec4<f32>, // the map's size in tiles xy, a tile in world units z
-    misc: vec4<f32>, // mode, lamp count, flashlight on (1/0)
+    misc: vec4<f32>, // mode, lamp count, flashlight on (1/0), crouched (1/0)
+    guard: vec4<f32>, // the guard xy, the way he faces (cos, sin); zero for none
     lights: array<vec4<f32>, 256>, // two a lamp: (x, y, reach, power), (r, g, b, 0)
 };
 
@@ -17,6 +18,9 @@ struct Params {
 // The opaque box's object (0: a wall), indoor, the half-height box's object, in a lit room.
 @group(#{MATERIAL_BIND_GROUP}) @binding(3) var extra: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(4) var low_boxes: texture_2d<f32>; // the half-height box
+@group(#{MATERIAL_BIND_GROUP}) @binding(5) var doors: texture_2d<f32>; // how shut, lying along x, glass
+// A smash's reach: sixteenths of a tile of it left, how strongly shown (hearing.rs).
+@group(#{MATERIAL_BIND_GROUP}) @binding(6) var heard: texture_2d<f32>;
 
 const FLOOR_GRASS: u32 = 0u;
 const FLOOR_ASPHALT: u32 = 1u;
@@ -43,6 +47,7 @@ const DECO_BAY: u32 = 4u;
 const DECO_ZEBRA: u32 = 8u;
 const DECO_VAULT_DOOR: u32 = 16u;
 const DECO_RUG: u32 = 32u;
+const DECO_SHARDS: u32 = 64u;
 
 const EYE_SPREAD: f32 = 7.0;
 const LENS_SPREAD: f32 = 5.0;
@@ -55,6 +60,11 @@ const TORCH_POWER: f32 = 1.5;
 const TORCH_REACH: f32 = 15.0;
 const DARK: f32 = 5.0;
 const VIEW: f32 = 12.0;
+// The guard's sight in tiles where lit (in the dark DARK), and half his cone.
+const GUARD_VIEW: f32 = 10.0;
+const GUARD_CONE: f32 = 0.7853982;
+const WATCHED: vec3<f32> = vec3<f32>(1.0, 0.42, 0.38);
+const HEARD: vec3<f32> = vec3<f32>(0.70, 0.85, 1.0);
 // The run through an opaque box, in world units, that stops a ray fully.
 const STOP_SOFT: f32 = 3.0;
 
@@ -95,6 +105,8 @@ struct Spot {
     low: u32,
     // A wall's top: only walls stand between it and anything, furniture is lower.
     top: bool,
+    // A door leaf: its own doorway's slab is not in its way.
+    door: bool,
 };
 
 fn spot_of(w: vec2<f32>) -> Spot {
@@ -104,15 +116,22 @@ fn spot_of(w: vec2<f32>) -> Spot {
     let in_box = b.z > b.x && f.x >= b.x && f.x <= b.z && f.y >= b.y && f.y <= b.w;
     let h = select(vec4<f32>(0.0), textureLoad(low_boxes, cell, 0), in_map(cell));
     let on_low = h.z > h.x && f.x >= h.x && f.x <= h.z && f.y >= h.y && f.y <= h.w;
-    return Spot(cell, in_box, select(0u, object_at(cell), in_box), select(0u, low_at(cell), on_low), false);
+    return Spot(cell, in_box, select(0u, object_at(cell), in_box), select(0u, low_at(cell), on_low), false, false);
 }
 
 // How far a → b runs inside opaque boxes (x) and through glass (y), in world
 // units. It skips the box the target pixel is on and every box of its object
 // (a cabinet's whole top is seen once its front is), and likewise the box
 // and object its source stands in (a lamp over furniture).
+// Where a ray enters and leaves a box in its cell, as shares of the ray.
+fn span(b: vec4<f32>, cell: vec2<i32>, p: vec2<f32>, inv: vec2<f32>) -> vec2<f32> {
+    let s0 = (vec2<f32>(cell) + b.xy - p) * inv;
+    let s1 = (vec2<f32>(cell) + b.zw - p) * inv;
+    return vec2<f32>(max(min(s0.x, s1.x), min(s0.y, s1.y)), min(max(s0.x, s1.x), max(s0.y, s1.y)));
+}
+
 // With `low`, z is how far b lies past the first half-height object crossed
-// (-1 for none).
+// (-1 for none), not counting one that either end is on.
 fn trace(a: vec2<f32>, b: vec2<f32>, src: Spot, dst: Spot, low: bool) -> vec3<f32> {
     let tile = P.map.z;
     let p = a / tile;
@@ -151,27 +170,36 @@ fn trace(a: vec2<f32>, b: vec2<f32>, src: Spot, dst: Spot, low: bool) -> vec3<f3
                     || (all(cell == src.cell) && src.in_box)
                     || (src.object != 0u && obj == src.object);
                 if !skip {
-                    let s0 = (vec2<f32>(cell) + o.xy - p) * inv;
-                    let s1 = (vec2<f32>(cell) + o.zw - p) * inv;
-                    let tn = max(min(s0.x, s1.x), min(s0.y, s1.y));
-                    let tf = min(max(s0.x, s1.x), max(s0.y, s1.y));
-                    opaque += max(0.0, min(tf, t1) - max(tn, t));
+                    let r = span(o, cell, p, inv);
+                    opaque += max(0.0, min(r.y, t1) - max(r.x, t));
                 }
             }
-            if tile_at(cell).y == WALL_GLASS && !all(cell == dst.cell) {
+            let k = tile_at(cell);
+            if k.y == WALL_GLASS && !all(cell == dst.cell) {
                 glass += t1 - t;
+            }
+            // A door: a thin slab across the doorway, as solid as it is shut.
+            if (k.w & DECO_DOOR) != 0u && !(dst.door && all(cell == dst.cell)) {
+                let shut = textureLoad(doors, cell, 0);
+                if shut.r > 0.0 {
+                    let slab = select(vec4<f32>(0.45, 0.0, 0.55, 1.0), vec4<f32>(0.0, 0.45, 1.0, 0.55), shut.g > 0.5);
+                    let r = span(slab, cell, p, inv);
+                    let through = max(0.0, min(r.y, t1) - max(r.x, t)) * shut.r;
+                    if shut.b > 0.5 {
+                        glass += through;
+                    } else {
+                        opaque += through;
+                    }
+                }
             }
             if low {
                 let h = textureLoad(low_boxes, cell, 0);
                 let id = low_at(cell);
-                if h.z > h.x && id != dst.low && (cover_exit < 0.0 || id == cover_id) {
-                    let s0 = (vec2<f32>(cell) + h.xy - p) * inv;
-                    let s1 = (vec2<f32>(cell) + h.zw - p) * inv;
-                    let tn = max(min(s0.x, s1.x), min(s0.y, s1.y));
-                    let tf = min(max(s0.x, s1.x), max(s0.y, s1.y));
-                    if min(tf, t1) > max(tn, t) {
+                if h.z > h.x && id != dst.low && id != src.low && (cover_exit < 0.0 || id == cover_id) {
+                    let r = span(h, cell, p, inv);
+                    if min(r.y, t1) > max(r.x, t) {
                         cover_id = id;
-                        cover_exit = max(cover_exit, min(tf, 1.0));
+                        cover_exit = max(cover_exit, min(r.y, 1.0));
                     }
                 }
             }
@@ -328,7 +356,50 @@ fn seen(w: vec2<f32>, dst: Spot) -> f32 {
     return clear / 3.0 * ranged;
 }
 
-fn shade(albedo: vec3<f32>, glow: bool, ground: bool, at: vec2<f32>) -> vec3<f32> {
+// The colour, and how clearly it is seen in alpha.
+// How clearly the guard sees a point, as guard.rs reckons it: in his cone,
+// within reach, by one ray. Where the flashlight shines (`torch`, its light)
+// he sees as far as in a lit room; that takes in the robber himself.
+fn watched(w: vec2<f32>, dst: Spot, torch: vec3<f32>) -> f32 {
+    let ahead = P.guard.zw;
+    if dot(ahead, ahead) < 0.5 {
+        return 0.0;
+    }
+    let off = w - P.guard.xy;
+    let dist = length(off);
+    let tile = P.map.z;
+    let cone = smoothstep(cos(GUARD_CONE + 0.05), cos(GUARD_CONE - 0.05), dot(off, ahead) / max(dist, 1e-3));
+    let lit = in_map(dst.cell) && textureLoad(extra, dst.cell, 0).a > 0.5;
+    let reach = mix(select(DARK, GUARD_VIEW, lit), GUARD_VIEW, smoothstep(0.02, 0.06, luma(torch))) * tile;
+    let near = cone * (1.0 - smoothstep(reach - 0.8 * tile, reach, dist));
+    if near <= 0.0 {
+        return 0.0;
+    }
+    var clear = clear_share(trace(P.guard.xy, w, spot_of(P.guard.xy), dst, false).x);
+    // The robber crouched, a spot is hidden from him as guard.rs hides the
+    // robber: traced from the spot, a half-height thing within 2 tiles.
+    if P.misc.w > 0.5 && !dst.top && dst.object == 0u {
+        let past = trace(w, P.guard.xy, dst, spot_of(P.guard.xy), true).z;
+        clear *= select(1.0, 1.0 - smoothstep(1.5 * tile, 2.0 * tile, past), past >= 0.0);
+    }
+    return near * clear;
+}
+
+fn heard_texel(c: vec2<i32>) -> vec2<f32> {
+    return select(vec2<f32>(0.0), textureLoad(heard, c, 0).rg, in_map(c));
+}
+
+// The noises' reach at a point, read between tile centres so its edge is smooth.
+fn heard_at(w: vec2<f32>) -> vec2<f32> {
+    let p = w / P.map.z - 0.5;
+    let c = vec2<i32>(floor(p));
+    let f = fract(p);
+    let lo = mix(heard_texel(c), heard_texel(c + vec2<i32>(1, 0)), f.x);
+    let hi = mix(heard_texel(c + vec2<i32>(0, 1)), heard_texel(c + vec2<i32>(1, 1)), f.x);
+    return mix(lo, hi, f.y);
+}
+
+fn shade(albedo: vec3<f32>, glow: bool, ground: bool, at: vec2<f32>) -> vec4<f32> {
     var w = at;
     var dst = spot_of(w);
     if dst.in_box && dst.object == 0u {
@@ -341,14 +412,28 @@ fn shade(albedo: vec3<f32>, glow: bool, ground: bool, at: vec2<f32>) -> vec3<f32
         dst.object = 0u;
         dst.low = 0u;
     }
+    dst.door = !ground;
+    let s = seen(w, dst);
     if glow {
-        return albedo * mix(0.35, 1.0, seen(w, dst));
+        return vec4<f32>(albedo * mix(0.35, 1.0, s), s);
     }
-    let light = light_at(w, dst) + torch_at(w, dst);
+    let torch = torch_at(w, dst);
+    let light = light_at(w, dst) + torch;
     let lit = albedo * (light + vec3<f32>(0.075, 0.08, 0.11));
     let dim = albedo * light;
     let fog = mix(dim, vec3<f32>(luma(dim)), 0.85) * 0.2 + albedo * vec3<f32>(0.004, 0.006, 0.014);
-    return mix(fog, lit, seen(w, dst));
+    var c = mix(fog, lit, s);
+    // His cone, a light red wash, only where the robber sees.
+    if s > 0.0 {
+        c = mix(c, srgb(WATCHED), 0.2 * s * watched(w, dst, torch));
+    }
+    // How far a smash carries: a faint ring where its reach runs out, in
+    // the fog too (it is his own noise).
+    let h = heard_at(w);
+    let left = h.x * 255.0 / 16.0;
+    let ring = smoothstep(0.0, 0.05, left) * (1.0 - smoothstep(0.08, 0.3, left));
+    c = mix(c, srgb(HEARD), h.y * 0.22 * ring);
+    return vec4<f32>(c, s);
 }
 
 fn hash_u(x: u32) -> u32 {
@@ -538,6 +623,33 @@ fn floor_colour(kind: u32, tint: u32, deco: u32, cell: vec2<i32>, f: vec2<f32>, 
             }
         }
     }
+    if (deco & DECO_SHARDS) != 0u {
+        // A smashed window: the frame's posts at its ends, glass strewn about.
+        let across_x = is_wall(cell - vec2<i32>(1, 0)) || is_wall(cell + vec2<i32>(1, 0));
+        let along = select(f.y, f.x, across_x);
+        let across = select(f.x, f.y, across_x);
+        let glass = vec3<f32>(0.72, 0.86, 0.92);
+        // Slivers, one in some 5-unit cells, each a thin diamond at its own angle.
+        let g = w / 5.0;
+        let k = vec2<i32>(floor(g));
+        if hash2(k) > 0.6 && abs(across - 0.5) < 0.46 {
+            let turn = hash2(k + vec2<i32>(5, 9)) * 3.14159;
+            let q = fract(g) - 0.5 + (vec2<f32>(hash2(k + vec2<i32>(3, 1)), hash2(k + vec2<i32>(1, 11))) - 0.5) * 0.4;
+            let r = vec2<f32>(q.x * cos(turn) + q.y * sin(turn), q.y * cos(turn) - q.x * sin(turn));
+            let len = 0.15 + 0.25 * hash2(k + vec2<i32>(17, 2));
+            if abs(r.y) < (len - abs(r.x)) * 0.45 {
+                c = mix(c, glass, 0.85);
+            }
+        }
+        // Jagged teeth of the pane still in the frame.
+        let tooth = 0.06 + 0.16 * hash2(vec2<i32>(i32(floor(across * 9.0)), cell.x * 7 + cell.y));
+        if along < tooth || along > 1.0 - tooth {
+            c = mix(c, vec3<f32>(0.55, 0.74, 0.82), 0.5);
+        }
+        if along < 0.05 || along > 0.95 {
+            c = vec3<f32>(0.26, 0.28, 0.30);
+        }
+    }
     return c;
 }
 
@@ -614,13 +726,18 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
         if t.y != WALL_NONE {
             c = wall_colour(t.y, cell, f, w, c);
         }
-        return vec4<f32>(shade(srgb(c), false, true, w), 1.0);
+        return vec4<f32>(shade(srgb(c), false, true, w).rgb, 1.0);
     }
 #ifdef VERTEX_COLORS
     let colour = mesh.color;
 #else
     let colour = vec4<f32>(1.0, 0.0, 1.0, 1.0);
 #endif
-    let glow = mesh.uv.x > 0.5;
-    return vec4<f32>(shade(colour.rgb, glow, false, w), colour.a);
+    if P.misc.x > 1.5 {
+        // Where a guard last saw the robber: pale and see-through, in any light.
+        return vec4<f32>(srgb(vec3<f32>(0.72, 0.84, 1.0)) * (0.3 + luma(colour.rgb)), colour.a * 0.45);
+    }
+    let c = shade(colour.rgb, mesh.uv.x > 0.5, false, w);
+    // A fading vertex (UV y = 1) is someone, gone out of sight.
+    return vec4<f32>(c.rgb, colour.a * select(1.0, c.a, mesh.uv.y > 0.5));
 }

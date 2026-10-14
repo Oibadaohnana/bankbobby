@@ -1,5 +1,9 @@
 use crate::dev::Script;
-use crate::movement::{Aabb, BODY_MARGIN, Body, MARCH_SPEED, STEP, Solids, Steer, TILE, approach};
+use crate::guard::Guard;
+use crate::inventory::{Inventory, Kind};
+use crate::movement::{
+    Aabb, BODY_MARGIN, Body, MARCH_SPEED, STEP, Solids, Steer, TILE, approach, wrap_angle,
+};
 use crate::paint;
 use crate::render::{Lamps, WorldMaterial, WorldMaterials, WorldPart, write_params};
 use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
@@ -13,9 +17,23 @@ pub struct Player {
     pub solids: Solids,
     /// The half-height props' bodies.
     pub cover: Vec<Aabb>,
+    /// The thickets he can hide in.
+    pub hideouts: Vec<Aabb>,
 }
 
 impl Player {
+    pub fn hidden(&self) -> bool {
+        self.hideout().is_some()
+    }
+
+    /// The thicket he is in.
+    pub fn hideout(&self) -> Option<Aabb> {
+        self.hideouts
+            .iter()
+            .copied()
+            .find(|h| h.contains(self.body.pos))
+    }
+
     pub fn in_cover(&self) -> bool {
         self.body.is_crouching()
             && self
@@ -34,12 +52,61 @@ pub struct Controls {
     pub roll: bool,
     pub torch: bool,
     pub crouch: bool,
+    /// The pointer in the world, while it is in the window.
+    pub pointer: Option<Vec2>,
 }
 
 #[derive(Resource, Default)]
 pub struct Shown {
     pub pos: Vec2,
 }
+
+/// A hand put out to a door as it opens or shuts: where, and how long ago.
+#[derive(Resource, Default)]
+pub struct Reach(pub Option<(Vec2, f32)>);
+
+const REACH_TIME: f32 = 0.4;
+
+/// The pistol held in both hands this far out from his chest, its barrel
+/// this long, swung onto the pointer within `AIM_ACROSS` of his facing
+/// (bims').
+const GRIP: f32 = 20.0;
+const GUN_LENGTH: f32 = 16.0;
+const AIM_ACROSS: f32 = 1.15;
+
+/// The aim's angle in his frame, the pointer `off` him in his frame.
+fn aim_at(off: Vec2) -> f32 {
+    off.to_angle().clamp(-AIM_ACROSS, AIM_ACROSS)
+}
+
+/// The two-handed grip aimed at `a`: his right hand on the grip, his left
+/// cupped under it.
+fn grip(a: f32) -> (Vec2, Vec2) {
+    let along = Vec2::from_angle(a);
+    let at = along * GRIP;
+    (
+        at - along.perp() * 1.5,
+        at - along * 2.0 + along.perp() * 3.0,
+    )
+}
+
+/// Where a shot leaves his pistol and which way, at `pos` facing `heading`:
+/// the grip is on the line from his chest to the pointer, and the barrel
+/// runs on along it.
+pub fn gun_line(pos: Vec2, heading: f32, pointer: Vec2) -> (Vec2, Vec2) {
+    let turn = Vec2::from_angle(heading);
+    let along = Vec2::from_angle(aim_at(Vec2::from_angle(-heading).rotate(pointer - pos)));
+    (
+        pos + turn.rotate(along * (GRIP + GUN_LENGTH)),
+        turn.rotate(along),
+    )
+}
+
+/// A swing of the crowbar, how long ago.
+#[derive(Resource, Default)]
+pub struct Swing(pub Option<f32>);
+
+const SWING_TIME: f32 = 0.35;
 
 #[derive(Component)]
 pub struct Robber;
@@ -51,8 +118,13 @@ pub enum Part {
     Bag,
     Torso,
     Arm(i8),
+    Hand(i8),
     Lens,
+    /// Drawn while it is in his hands.
+    Tool(Kind),
     Head,
+    /// The pistol, held out in both hands.
+    Gun,
     Streak(i8),
 }
 
@@ -63,6 +135,8 @@ impl Plugin for PlayerPlugin {
         app.insert_resource(Time::<Fixed>::from_seconds(STEP as f64))
             .init_resource::<Controls>()
             .init_resource::<Shown>()
+            .init_resource::<Reach>()
+            .init_resource::<Swing>()
             .add_systems(
                 PreUpdate,
                 read_controls
@@ -86,9 +160,12 @@ pub fn spawn_robber(
     at: Vec2,
 ) {
     let p = paint::robber();
-    let [foot, knee, arm, crowbar, torch, lens, streak] =
-        [p.foot, p.knee, p.arm, p.crowbar, p.torch, p.lens, p.streak]
-            .map(|m| Mesh2d(meshes.add(m)));
+    let [foot, knee, arm, glove, crowbar, torch, lens, streak] = [
+        p.foot, p.knee, p.arm, p.glove, p.crowbar, p.torch, p.lens, p.streak,
+    ]
+    .map(|m| Mesh2d(meshes.add(m)));
+    let coin = Mesh2d(meshes.add(paint::coin()));
+    let pistol = Mesh2d(meshes.add(paint::pistol()));
     let mat = MeshMaterial2d(material);
     commands
         .spawn((
@@ -130,6 +207,12 @@ pub fn spawn_robber(
                 Transform::from_xyz(-13.0, 0.0, 0.2),
             ));
             for side in [-1i8, 1] {
+                r.spawn((
+                    Part::Hand(side),
+                    glove.clone(),
+                    mat.clone(),
+                    Transform::from_xyz(16.0, 14.0 * side as f32, 0.36),
+                ));
                 let hand = Transform::from_xyz(15.0, 0.0, 0.05);
                 r.spawn((
                     Part::Arm(side),
@@ -140,12 +223,20 @@ pub fn spawn_robber(
                 .with_children(|a| {
                     if side < 0 {
                         a.spawn((
+                            Part::Tool(Kind::Crowbar),
                             crowbar.clone(),
                             mat.clone(),
                             hand.with_rotation(Quat::from_rotation_z(0.35)),
                         ));
+                        a.spawn((
+                            Part::Tool(Kind::Coin),
+                            coin.clone(),
+                            mat.clone(),
+                            hand.with_translation(vec3(17.0, 0.0, 0.1)),
+                        ));
                     } else {
                         a.spawn((
+                            Part::Tool(Kind::Flashlight),
                             torch.clone(),
                             mat.clone(),
                             hand.with_rotation(Quat::from_rotation_z(0.42)),
@@ -162,6 +253,13 @@ pub fn spawn_robber(
                     }
                 });
             }
+            r.spawn((
+                Part::Gun,
+                pistol.clone(),
+                mat.clone(),
+                Transform::from_xyz(GRIP, 0.0, 0.33),
+                Visibility::Hidden,
+            ));
             r.spawn((
                 Part::Head,
                 Mesh2d(meshes.add(p.head)),
@@ -186,6 +284,7 @@ fn read_controls(
     window: Query<&Window, With<PrimaryWindow>>,
     camera: Query<(&Camera, &GlobalTransform)>,
     shown: Res<Shown>,
+    inventory: Res<Inventory>,
     mut controls: ResMut<Controls>,
 ) {
     let held = |k: KeyCode, name: &str| keys.pressed(k) || script.held(name);
@@ -217,8 +316,14 @@ fn read_controls(
     {
         controls.roll = true;
     }
-    if keys.just_pressed(KeyCode::KeyT) || script.pressed("Torch") {
+    if keys.just_pressed(KeyCode::KeyF) || script.pressed("Torch") {
         controls.torch = !controls.torch;
+    }
+    // Only a flashlight in his hand shines; put away, it goes off.
+    controls.torch &= inventory.holds(Kind::Flashlight);
+    // The pointer is the inventory's while it is open.
+    if inventory.open {
+        return;
     }
     if let Some(aim) = script.aim {
         controls.aim = aim;
@@ -227,9 +332,10 @@ fn read_controls(
     let (Ok(window), Ok((camera, at))) = (window.single(), camera.single()) else {
         return;
     };
-    if let Some(cursor) = window.cursor_position()
-        && let Ok(world) = camera.viewport_to_world_2d(at, cursor)
-    {
+    controls.pointer = window
+        .cursor_position()
+        .and_then(|c| camera.viewport_to_world_2d(at, c).ok());
+    if let Some(world) = controls.pointer {
         let off = world - shown.pos;
         if off.length() > 1.0 {
             controls.aim = off.y.atan2(off.x);
@@ -244,6 +350,7 @@ fn step(mut player: ResMut<Player>, mut controls: ResMut<Controls>) {
         aim: controls.aim,
         sprint: controls.sprint,
         crouch: controls.crouch,
+        thick: player.hidden(),
     });
     if controls.roll {
         controls.roll = false;
@@ -261,11 +368,15 @@ fn show(player: Res<Player>, time: Res<Time<Fixed>>, mut shown: ResMut<Shown>) {
     };
 }
 
+#[allow(clippy::too_many_arguments)]
 fn animate(
     player: Res<Player>,
     controls: Res<Controls>,
+    inventory: Res<Inventory>,
     shown: Res<Shown>,
     time: Res<Time>,
+    mut reach: ResMut<Reach>,
+    mut strike: ResMut<Swing>,
     mut crouch: Local<f32>,
     mut root: Query<&mut Transform, (With<Robber>, Without<Part>)>,
     mut parts: Query<(&Part, &mut Transform, &mut Visibility), Without<Robber>>,
@@ -275,6 +386,19 @@ fn animate(
         return;
     };
     let rolling = b.roll_share();
+    reach.0 = reach.0.map(|(at, age)| (at, age + time.delta_secs()));
+    reach.0 = reach
+        .0
+        .filter(|&(_, age)| age < REACH_TIME && rolling.is_none());
+    strike.0 = strike
+        .0
+        .map(|age| age + time.delta_secs())
+        .filter(|&age| age < SWING_TIME && rolling.is_none());
+    // The arm on the door's side turns to it and stretches, and back.
+    let push = reach.0.map(|(at, age)| {
+        let rel = wrap_angle((at - shown.pos).to_angle() - b.heading);
+        (rel, (PI * age / REACH_TIME).sin())
+    });
     t.translation = shown.pos.extend(10.0);
     t.rotation = Quat::from_rotation_z(b.heading);
     let down = if b.is_crouching() { 1.0 } else { 0.0 };
@@ -299,6 +423,12 @@ fn animate(
     };
 
     let sprint = b.is_sprinting();
+    // The pistol in hand (not mid-roll): at the pointer, or ahead.
+    let aim = (inventory.holds(Kind::Pistol) && rolling.is_none()).then(|| {
+        controls.pointer.map_or(0.0, |p| {
+            aim_at(Vec2::from_angle(-b.heading).rotate(p - shown.pos))
+        })
+    });
     let pace = if rolling.is_some() {
         0.0
     } else {
@@ -326,17 +456,70 @@ fn animate(
                 pt.translation.y = 7.5 * sd;
                 pt.scale = Vec3::splat(c);
             }
-            Part::Arm(side) => {
+            Part::Arm(side) | Part::Hand(side) => {
                 let sd = side as f32;
                 let swing = if sprint { 0.55 } else { m(0.14, 0.05) };
-                pt.rotation = Quat::from_rotation_z(m(-0.42, -0.2) * sd - s * sd * swing * pace);
-                let x = if sprint {
+                let mut a = m(-0.42, -0.2) * sd - s * sd * swing * pace;
+                let mut x = if sprint {
                     1.0 - s * sd * 3.0
                 } else {
                     m(1.0, 6.0)
                 };
-                flip(&mut pt, x, 8.0, 0.3);
-                pt.translation.y = m(14.0, 13.0) * sd;
+                let mut k = 0.0;
+                if let Some((rel, kk)) = push.filter(|&(rel, _)| (rel > 0.0) == (sd > 0.0)) {
+                    a += (rel.clamp(-2.4, 2.4) - a) * kk;
+                    x += 5.0 * kk;
+                    k = kk;
+                }
+                if aim.is_some() {
+                    x = 3.0;
+                }
+                // The crowbar's swing: out to his side, then hard across.
+                if let Some(age) = strike.0
+                    && side < 0
+                {
+                    let t = age / SWING_TIME;
+                    a += sd * (TAU * t).sin() * 1.1;
+                    x += 4.0 * (PI * t).sin();
+                }
+                let shoulder = vec2(x, m(14.0, 13.0) * sd);
+                let out = shoulder + Vec2::from_angle(a) * 15.0;
+                // An empty hand hangs by his hip, swung against his step (on
+                // his knee, crouched), unless it goes out to a door.
+                let held = if side < 0 {
+                    [Kind::Crowbar, Kind::Coin, Kind::Pistol]
+                        .iter()
+                        .any(|&k| inventory.holds(k))
+                } else {
+                    inventory.holds(Kind::Flashlight)
+                };
+                let hand = if held {
+                    out
+                } else {
+                    let pump = if sprint { 10.0 } else { 6.0 };
+                    let hang = vec2(m(-2.0 - s * sd * pump * pace, 19.0), m(19.5, 9.5) * sd);
+                    hang.lerp(out, k)
+                };
+                // The pistol held out in both hands.
+                let hand = aim.map_or(hand, |a| {
+                    let (right, left) = grip(a);
+                    if side < 0 { right } else { left }
+                });
+                // Head over heels, as `flip` turns the rest.
+                let fx = |v: f32| v * cos + 8.0 * sin;
+                let z = if rolling.is_some() {
+                    (8.0 * cos - shoulder.x * sin) * 0.03
+                } else {
+                    0.3
+                };
+                if matches!(*part, Part::Hand(_)) {
+                    pt.translation = vec3(fx(hand.x), hand.y, z + 0.06);
+                } else {
+                    let d = vec2(fx(hand.x) - fx(shoulder.x), hand.y - shoulder.y);
+                    pt.translation = vec3(fx(shoulder.x), shoulder.y, z);
+                    pt.rotation = Quat::from_rotation_z(d.to_angle());
+                    pt.scale.x = d.length() / 15.0;
+                }
             }
             Part::Torso => {
                 pt.rotation = Quat::from_rotation_z(0.07 * s * pace);
@@ -350,6 +533,17 @@ fn animate(
                 pt.scale = Vec3::new(bob, 1.0 / bob, 1.0) * m(1.0, 0.92);
                 pt.rotation = Quat::from_rotation_z(-0.1 * s * pace);
                 flip(&mut pt, m(-13.0, -6.0), 6.0, 0.2);
+            }
+            Part::Gun => {
+                *vis = if aim.is_some() {
+                    Visibility::Inherited
+                } else {
+                    Visibility::Hidden
+                };
+                if let Some(a) = aim {
+                    pt.translation = (Vec2::from_angle(a) * GRIP).extend(0.33);
+                    pt.rotation = Quat::from_rotation_z(a);
+                }
             }
             Part::Head => {
                 let x = if sprint { 4.5 } else { m(2.0, 11.0) };
@@ -365,6 +559,13 @@ fn animate(
                 let flicker = 0.6 + 0.4 * ((clock * 30.0 + k as f32 * 2.1).sin() * 0.5 + 0.5);
                 pt.scale = Vec3::new(flicker * (1.0 + 0.4 * (k as f32).abs()), 1.0, 1.0);
             }
+            Part::Tool(kind) => {
+                *vis = if inventory.holds(kind) {
+                    Visibility::Inherited
+                } else {
+                    Visibility::Hidden
+                };
+            }
             Part::Lens => {
                 *vis = if controls.torch {
                     Visibility::Inherited
@@ -376,10 +577,13 @@ fn animate(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn follow(
     shown: Res<Shown>,
     player: Res<Player>,
     controls: Res<Controls>,
+    guards: Query<&Guard>,
+    time: Res<Time<Fixed>>,
     mut camera: Query<&mut Transform, (With<Camera2d>, Without<Robber>)>,
     world_materials: Res<WorldMaterials>,
     lamps: Res<Lamps>,
@@ -394,6 +598,10 @@ fn follow(
         player.body.heading,
         controls.torch,
         player.body.is_crouching(),
+        guards
+            .iter()
+            .next()
+            .map_or(Vec4::ZERO, |g| g.view(time.overstep_fraction())),
         &world_materials,
         &lamps,
         &mut materials,

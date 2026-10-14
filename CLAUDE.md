@@ -16,8 +16,9 @@ game is. This file covers how to work on it.
 
 ## Build, test, look
 
-- Work inside `nix-shell shell.nix`, which provides cargo, the runtime libs
-  and weston. `cargo build --offline`, `cargo test --offline`,
+- Work inside `nix-shell shell.nix`, which provides cargo, the runtime libs,
+  ALSA (linked by Bevy's audio) and weston. Smoke runs are silent; a sound
+  is only heard in a normal run. `cargo build --offline`, `cargo test --offline`,
   `cargo clippy --offline --all-targets` (keep it warning-free), and
   `rustfmt --edition 2024 src/*.rs`.
 - `cargo build` proves nothing about the picture, so look at a screenshot:
@@ -38,10 +39,21 @@ game is. This file covers how to work on it.
 | --- | --- |
 | `src/movement.rs` | bims' steered walk: `Body`, `Steer`, `Solids`, `Aabb::push_out_round`. Pure arithmetic, stepped at 60 Hz. |
 | `src/map.rs` | the generator: tiles, rooms, props, lamps; `solids()` for movement, `occluders()` for the ray tracer |
-| `src/paint.rs` | `Painter` (vertex-coloured triangles) and every prop's and the robber's picture |
+| `src/paint.rs` | `Painter` (vertex-coloured triangles) and every prop's, the robber's and the guard's picture |
 | `src/render.rs` | `WorldMaterial`, the three grid textures, spawning a map, writing the robber, the flashlight and the lamps each frame |
 | `src/shaders/world.wgsl` | the per-pixel ray tracing (lamp and flashlight shadows), the procedural floors and walls |
 | `src/player.rs` | input → `Controls` (PreUpdate), the body's fixed step (FixedUpdate), the picture blended between steps, camera, zoom |
+| `src/doors.rs` | door leaves (`Map::doors`): pushed open within reach (and `Reach` for his arm), the glass entrance by sensor; write how shut each is into the doors texture |
+| `src/guard.rs` | the guard: T then a click gives him a path over `Map::free` tiles, his fixed step along it, his picture; seeing the robber (`detect`) he chases, losing him he runs to `last_seen`, marked by the robber's ghost; hearing a `Noise` or the robber's feet (`Sight::carry` reaching his tile) he goes to look, marked by a "?"; the "!"; E from behind knocks him out (`out`, `fall`: lying, blind and deaf, a "Zz") |
+| `src/hearing.rs` | how far the robber's feet carry (`feet`), and the ring showing how far a smash reaches: `Sight::carry` per tile into the `heard` texture (tiles of reach left), which the shader draws a faint ring from where it runs out |
+| `src/sight.rs` | the shader's `seen` on the CPU over the same grids and the doors texture's bytes, for the guard |
+| `src/inventory.rs` | the gear: items (a stack of coins is one, `count`) on cells of one grid (`GRID`) or in the hands, `fits`/`put`/`stow`/`add`/`remove`, quick slots |
+| `src/inventory_ui.rs` | the Tab screen and the quick-slot bar (and the VICINITY panel of a knocked-out guard's pockets close by): one mesh rebuilt every frame (a child of the camera, scaled by its zoom, in logical pixels from the window's middle), UI text over it, drag and drop |
+| `src/smash.rs` | the crowbar's left click: the window in front breaks (`Map::smash`), and everything built from the map is rebuilt |
+| `src/throw.rs` | coins: the range ring and landing marker in hand, thrown with a left click (`landing` short of solids), flying, plinging (a `Noise`), lying on the floor till a guard pockets them (`Guard::pockets`) or the robber picks one up (E) |
+| `src/prompt.rs` | the "E ..." prompt: what E would do offers itself each frame (`Prompt`, cleared in `First`; the knockout first), shown where it says |
+| `src/guns.rs` | pistols: the robber's aimed by `player::gun_line` (bims' carry onto the pointer), fired and reloaded, the guard's drawn when the robber is armed and seen; hitscan `shoot` (`Sight::stops`), tracers, the reticle, health (`Gunplay`) |
+| `src/sound.rs` | the old game's door and footstep samples (`sounds/*.ogg`, embedded): `Noise` messages and walkers' loops, placed by distance and sight as `audio.js` did |
 | `src/dev.rs` | the `BB_*` switches for headless runs |
 
 ## Things easy to get wrong
@@ -49,7 +61,8 @@ game is. This file covers how to work on it.
 - **Movement numbers are bims'.** `MARCH_SPEED` 216, `ACCEL` 330 × 4
   under the keys, instant stop, `SPRINT` 1.8, the roll 195 / 0.38 s / 1.1 s,
   `BODY_MARGIN` 23, `CORNER_ROUND` 1.5 × margin, `TILE` 52. The tests in
-  `movement.rs` pin the feel. Change them only on purpose.
+  `movement.rs` pin the feel. Change them only on purpose. `THICK` (half
+  pace in a thicket) is ours, not bims'.
 - **An opaque box must lie inside a solid one.** The flashlight's rays start
   at the robber's hand, so a body inside an opaque box would light nothing.
   Make every opaque prop solid; a test enforces this.
@@ -80,8 +93,52 @@ game is. This file covers how to work on it.
   shader are written in sRGB and converted with `srgb()`. Vertex colours
   are linear (`paint::Hex::paint`).
 - **Glowing vertices** (UV x = 1) ignore light altogether, so keep them for
-  things that are lights: the street lamps' heads and the flashlight's lens.
+  things that are lights: the street lamps' heads, the flashlight's lens,
+  and the guard's "!", which must read in the dark.
   Screens, LEDs and the like are ordinary paint, or they shine in a dark
   room. Glow can go past white for the bloom.
-- **Everything spawned for a map carries `WorldPart`.** R despawns all of
+- **Noises are messages** (`sound::Noise`): a sample to play, if there is
+  one, and `loud`, how many tiles off a guard hears it. The sound plugin
+  plays them, the guard listens to the same ones, and hearing.rs shows
+  the glass's. How far one reaches is `Sight::carry`, a Dijkstra over tiles (a
+  wall or shut door costs `THROUGH_WALL` more), the same for the guard and
+  for the ring drawn, so what you see is what he hears.
+- **A left click while T is armed is the guard's order**: `order` clears it
+  so the crowbar does not swing (nor a coin fly) too. Otherwise a left click
+  uses what is in hand: the crowbar smashes, a coin is thrown, the pistol
+  fires. R reloads (only with the pistol in hand); a new bank is F5.
+- **A pistol's `count` is the rounds in its magazine**, not a stack.
+- **Items are indexed**: quick slots and drags hold indices into
+  `Inventory::items`, so take items out only with `Inventory::remove`
+  (or `use_one`), which keeps the quick slots right.
+- **Sight is written twice**: `seen`/`trace` in world.wgsl and in
+  `sight.rs`. Change one, change the other. The guard's check is traced
+  from the robber to the guard (sight is mutual), so the crouched cover
+  rule hides the robber from him exactly as it hides him from the robber.
+  His cone (`CONE`, `GUARD_VIEW` in guard.rs) is drawn by `watched` in
+  world.wgsl, from `Params::guard` (the first guard only); keep the two
+  in step too.
+- **Fading vertices** (UV y = 1, `Painter::fades`) take how clearly they
+  are seen as alpha: people vanish out of sight instead of showing under
+  the fog. Only for things on the blended material.
+- **Three world materials**: ground (mode 0), things (1) and ghosts (2,
+  `render::ghost_material`), which draw any mesh pale and see-through,
+  unlit and unfogged.
+- **Only a held flashlight shines**: `read_controls` clears `Controls::torch`
+  unless the flashlight is in his hands, so everything that reads `torch`
+  (the shader, the guard, sight and sound) follows. The robber's tools are
+  `Part::Tool`, shown while held.
+- **Thickets are hideouts** (`PropKind::is_hideout`): not solid, so he walks
+  in, but placed like a solid prop and their tiles kept clear. In one
+  (`Player::hideout`) a guard only goes on seeing him if he already did, or
+  if he is in the same thicket.
+- **Everything spawned for a map carries `WorldPart`.** F5 despawns all of
   them and builds the next map.
+- **The doors and tiles textures are rewritten at run time** (doors swing,
+  windows get smashed), so they keep their data in the main world
+  (`RenderAssetUsages::default()`); the others are render-world only and
+  have no data to write. A smash also rebuilds what came from the map: the
+  robber's `Solids`, the guard's `Walkable` and `Sight`, from `smash::Bank`,
+  the map kept as it now stands. A shut door is a thin slab
+  across its doorway in `trace`, opaque (glass for the entrance) times how
+  shut it is. Doors never block movement: they open before he gets there.
